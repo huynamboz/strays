@@ -1,212 +1,87 @@
 // strays: the processes Claude Code started and left running, in any session.
-// Claude Code marks every process it starts (CLAUDECODE=1 and its session's id
-// in the environment), and a process keeps that mark after its session is gone:
-// bin/scan.sh finds them all, /strays lists them with their ports, and Enter
-// ends the one under the cursor, or one key every one whose session is gone.
+// bin/scan.sh finds them (by Claude Code's mark, the Bash tool's shell, the
+// process tree and the process group); /strays lists them, numbered, wherever
+// Claude Code runs; `/strays 2` shows one in full and `/strays kill 2` ends it;
+// `/strays ui` opens a panel in the terminal and the desktop app where a click
+// on a row shows it in full and a click on End ends it.
 import type { EngineInterface, Register } from 'claude-code'
 
+import {
+  HELP,
+  SECTIONS,
+  age,
+  basename,
+  detailText,
+  facts,
+  fit,
+  group,
+  listText,
+  megabytes,
+  parse,
+  parseArgs,
+  parseInfo,
+  plural,
+  portsOf,
+  portsText,
+  resolve,
+  shown,
+  visible,
+} from './procs'
+import type { Group, Info, Kind } from './procs'
+
 const PANE = 'strays'
-
-/** One marked process, as bin/scan.sh prints it. */
-export type Proc = {
-  pid: number
-  ppid: number
-  seconds: number
-  rssKb: number
-  sid: string
-  hasClaudePid: boolean
-  isAlive: boolean
-  isAttached: boolean
-  ports: number[]
-  cwd: string
-  command: string
-}
-
-/**
- * Why a process is here: its session is gone (`orphan`); its session runs but
- * it was cut loose from it, as with nohup or & (`detached`); it still hangs
- * under a running session (`running`); it is a session's MCP server (`mcp`).
- */
-export type Kind = 'orphan' | 'detached' | 'running' | 'mcp'
-
-/** A process and everything it started, shown and ended as one. */
-export type Group = {
-  pid: number
-  kind: Kind
-  label: string
-  pids: number[]
-  ports: number[]
-  rssKb: number
-  seconds: number
-  cwd: string
-  sid: string
-}
-
-const SECTIONS: { kind: Kind; title: string; why: string }[] = [
-  { kind: 'orphan', title: 'Left behind', why: 'session closed' },
-  { kind: 'detached', title: 'In the background', why: 'session still open' },
-  { kind: 'running', title: 'Still running', why: 'under an open session, for over a minute' },
-  { kind: 'mcp', title: 'MCP servers', why: 'ending one breaks its session' },
-]
+const COMMANDS = ['strays', 'ps']
+/** The color each kind is drawn in, everywhere it shows. */
+const ACCENT: Record<Kind, string> = { orphan: 'yellow', detached: 'cyan', running: 'green', mcp: 'gray' }
+const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+// How many frames a bar takes to grow to its length when the panel opens.
+const GROW = 6
 
 let groups: Group[] = []
 let me = ''
 let isPaneOpen = false
 let isScanning = false
 let showsMcp = false
-// The row asked to end and waiting for a second Enter; `all` is the end-all key.
+// The row asked to end and waiting for a second press; `all` is the end-all button.
 let armed: number | 'all' | null = null
 let arming = 0
 let ticks = 0
 let statusText: string | undefined
 let note = ''
-// The key of the control that holds the pane's focus ring.
+// The key of the control that holds the panel's focus ring.
 let focused = ''
-
-/** The color each kind is drawn in, everywhere it shows. */
-const ACCENT: Record<Kind, string> = { orphan: 'yellow', detached: 'cyan', running: 'green', mcp: 'gray' }
-
-export function parse(stdout: string): Proc[] {
-  const procs: Proc[] = []
-  for (const line of stdout.split('\n')) {
-    const f = line.split('\t')
-    if (f.length < 11) continue
-    procs.push({
-      pid: Number(f[0]),
-      ppid: Number(f[1]),
-      seconds: Number(f[2]),
-      rssKb: Number(f[3]),
-      sid: f[4] ?? '',
-      hasClaudePid: f[5] !== '',
-      isAlive: f[6] === '1',
-      isAttached: f[7] === '1',
-      ports: (f[8] ?? '').split(',').filter(Boolean).map(Number),
-      cwd: f[9] ?? '',
-      command: f.slice(10).join(' '),
-    })
-  }
-
-  return procs
-}
-
-const basename = (path: string) => path.slice(path.lastIndexOf('/') + 1)
-const isSession = (command: string) => basename(command.split(' ')[0] ?? '') === 'claude'
-
-/** The command as a person would recognize it: what the Bash tool was asked to run, every path cut to its name. */
-export function describe(command: string) {
-  let text = command
-  // The Bash tool runs a command as `zsh -c source <snapshot> … && eval '<command>' …`
-  const at = text.indexOf("eval '")
-  if (text.includes('/shell-snapshots/') && at >= 0) {
-    text = text.slice(at + 6)
-    const quote = text.lastIndexOf("'")
-    if (quote > 0) text = text.slice(0, quote)
-  }
-
-  text = text.replace(/\s+/g, ' ').trim()
-  // An app's program sits in a bundle whose path may hold spaces: name it for
-  // the bundle, and go on with what follows the program.
-  let name = ''
-  const bundle = text.lastIndexOf('.app/Contents/MacOS/')
-  if (text.startsWith('/') && bundle >= 0) {
-    name = basename(text.slice(0, bundle))
-    const rest = text.slice(bundle + '.app/Contents/MacOS/'.length)
-    text = rest.startsWith(name) ? rest.slice(name.length) : rest.slice(Math.max(0, rest.indexOf(' ')))
-  }
-  // Every path is cut to its last name: node_modules/.bin/vite reads vite.
-  const isPath = (word: string) => word.includes('/') && !word.startsWith('-') && !word.includes('://') && !word.endsWith('/')
-  const words = text
-    .split(' ')
-    .filter(Boolean)
-    .map(word => (isPath(word) ? basename(word) : word))
-
-  return [name, ...words].filter(Boolean).join(' ')
-}
-
-// A browser's crash reporter runs beside it and ends with it: not worth a row.
-const isNoise = (command: string) => /crashpad[_-]handler/.test(command)
-
-export function group(procs: Proc[]): Group[] {
-  const shown = procs.filter(p => !isSession(p.command) && !isNoise(p.command))
-  const pids = new Set(shown.map(p => p.pid))
-  const children = new Map<number, Proc[]>()
-  for (const p of shown) children.set(p.ppid, [...(children.get(p.ppid) ?? []), p])
-  const out: Group[] = []
-  for (const root of shown) {
-    if (pids.has(root.ppid)) continue
-    const members: Proc[] = []
-    for (const queue = [root]; queue.length > 0; ) {
-      const next = queue.shift()
-      if (!next) break
-      members.push(next)
-      queue.push(...(children.get(next.pid) ?? []))
-    }
-    const kind: Kind = !root.isAlive ? 'orphan' : !root.hasClaudePid ? 'mcp' : root.isAttached ? 'running' : 'detached'
-    out.push({
-      pid: root.pid,
-      kind,
-      label: describe(root.command),
-      // children first, so a parent does not restart what was just ended
-      pids: members.map(m => m.pid).reverse(),
-      ports: [...new Set(members.flatMap(m => m.ports))].sort((a, b) => a - b),
-      rssKb: members.reduce((sum, m) => sum + m.rssKb, 0),
-      seconds: root.seconds,
-      cwd: root.cwd,
-      sid: root.sid,
-    })
-  }
-
-  return out.sort((a, b) => b.seconds - a.seconds)
-}
-
-export function age(seconds: number) {
-  if (seconds < 60) return `${seconds}s`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`
-
-  return `${Math.floor(seconds / 86400)}d ${Math.floor((seconds % 86400) / 3600)}h`
-}
-
-const megabytes = (kb: number) =>
-  kb >= 1024 * 1024 ? `${(kb / 1024 / 1024).toFixed(1)} GB` : `${Math.max(1, Math.round(kb / 1024))} MB`
-const portsText = (g: Group) => g.ports.map(p => `:${p}`).join(' ')
-const portsOf = (list: Group[]) => {
-  const ports = [...new Set(list.flatMap(g => g.ports))].map(p => `:${p}`)
-
-  return ports.length > 4 ? `${ports.slice(0, 4).join(' ')} +${ports.length - 4}` : ports.join(' ')
-}
-const strays = () => groups.filter(g => g.kind === 'orphan' || g.kind === 'detached')
-const orphans = () => groups.filter(g => g.kind === 'orphan')
-// A command the Bash tool is running right now is not worth a row: under an open
-// session, only what has run for a minute is shown.
-const visible = (kind: Kind) => groups.filter(g => g.kind === kind && (kind !== 'running' || g.seconds >= 60))
-const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : word.endsWith('s') ? 'es' : 's'}`
-const fit = (text: string, width: number) =>
-  text.length > width ? text.slice(0, Math.max(1, width - 1)) + '…' : text.padEnd(width)
-
-/** How wide each column is, so every row of the list lines up. */
-export function widths(list: Group[], columns: number) {
-  const port = Math.min(14, Math.max(5, ...list.map(g => portsText(g).length)))
-  const folder = Math.min(16, Math.max(4, ...list.map(g => (basename(g.cwd) || '/').length)))
-  // age and memory are short and right-aligned; the command gets what it needs, up to what is left
-  const longest = Math.max(16, ...list.map(g => g.label.length))
-  const name = Math.min(longest, Math.max(16, columns - port - folder - 6 - 8 - 4 * 2 - 4))
-
-  return { port, name, folder }
-}
-
-/** One process as one line: port, command, folder, age, memory. */
-export function line(g: Group, w: ReturnType<typeof widths>) {
-  return [
-    fit(portsText(g) || '—', w.port),
-    fit(g.label, w.name),
-    fit(basename(g.cwd) || '/', w.folder),
-    age(g.seconds).padStart(6),
-    megabytes(g.rssKb).padStart(8),
-  ].join('  ')
-}
+// The pids of the last numbered list, in order: what `/strays 2` names.
+let order: number[] = []
+// The group the panel shows in full, and what bin/info.sh said of it.
+let detail: number | null = null
+let info: { pid: number; data: Info } | null = null
+// Animation: a frame counter that runs only while something moves.
+let frame = 0
+let runUntil = 0
+let timer: { cancel: () => void } | null = null
+let openedAt = 0
+let spinUntil = 0
+const ending = new Set<number>()
+// The lists printed in this session, by their text: the transcript draws them from these.
+const printed = new Map<string, { groups: Group[]; order: number[] }>()
 
 const redraw = ($: EngineInterface) => $.ui.invalidate('ui.render')
+const strays = () => groups.filter(g => g.kind === 'orphan' || g.kind === 'detached')
+const orphans = () => groups.filter(g => g.kind === 'orphan')
+
+/** Keeps the frames coming for `frames` more, and stops by itself when nothing moves. */
+function animate($: EngineInterface, frames: number) {
+  runUntil = Math.max(runUntil, frame + frames)
+  if (timer) return
+  timer = $.clock.every(90, () => {
+    frame += 1
+    if (isPaneOpen) redraw($)
+    if (frame >= runUntil && ending.size === 0) {
+      timer?.cancel()
+      timer = null
+    }
+  })
+}
 
 async function scan($: EngineInterface) {
   if (isScanning) return
@@ -215,6 +90,7 @@ async function scan($: EngineInterface) {
     const ran = await $.process.run(['sh', `${$.plugin.root}/bin/scan.sh`], { timeoutMs: 20_000 })
     if (ran.exitCode !== 0) throw new Error(ran.stderr.trim() || `scan exited ${ran.exitCode}`)
     groups = group(parse(ran.stdout))
+    if (detail !== null && !groups.some(g => g.pid === detail)) detail = null
     const left = strays()
     const text =
       left.length === 0
@@ -233,19 +109,57 @@ async function scan($: EngineInterface) {
 }
 
 async function stop($: EngineInterface, list: Group[]) {
-  const pids = list.flatMap(g => g.pids)
-  if (pids.length === 0) return 0
-  const ran = await $.process.run(['sh', `${$.plugin.root}/bin/kill.sh`, ...pids.map(String)], { timeoutMs: 20_000 })
-  const ended = ran.stdout.trim().split(/\s+/).filter(Boolean).length
-  note = `ended ${plural(ended, 'process')}`
+  const targets = list.flatMap(g => g.members.map(m => `${m.pid}@${m.start}`))
+  if (targets.length === 0) return 0
+  for (const g of list) ending.add(g.pid)
+  animate($, 4)
+  redraw($)
+  let ended = 0
+  try {
+    const ran = await $.process.run(['sh', `${$.plugin.root}/bin/kill.sh`, ...targets], { timeoutMs: 20_000 })
+    ended = ran.stdout.trim().split(/\s+/).filter(Boolean).length
+    note =
+      ended > 0
+        ? `ended ${list.length === 1 ? (list[0]?.label ?? '') : plural(ended, 'process')}`
+        : 'nothing was ended: it had already gone or changed'
+  } finally {
+    for (const g of list) ending.delete(g.pid)
+  }
   await scan($)
 
   return ended
 }
 
+async function loadInfo($: EngineInterface, g: Group) {
+  try {
+    const ran = await $.process.run(['sh', `${$.plugin.root}/bin/info.sh`, String(g.pid), g.sid, g.claudePid], { timeoutMs: 10_000 })
+    const data = parseInfo(ran.stdout)
+    info = { pid: g.pid, data }
+
+    return data
+  } catch {
+    return null
+  }
+}
+
+/** Shows one group in full in the panel, or the list again. */
+async function view($: EngineInterface, pid: number | null) {
+  detail = pid
+  armed = null
+  note = ''
+  openedAt = frame
+  animate($, GROW + 2)
+  const g = groups.find(x => x.pid === pid)
+  if (g) await loadInfo($, g)
+  redraw($)
+  const key = pid === null ? `row-${shown(groups, showsMcp)[0]?.pid ?? ''}` : 'back'
+  const moved = await $.ui.focus({ requestId: PANE, key }).catch(err => ({ deny: String(err) }))
+  if (!moved.deny) focused = key
+}
+
 /**
  * The first press asks, the second one within four seconds ends: `what` is a
- * row's pid or `all`. A press elsewhere, or the wait, takes the question back.
+ * group's pid or `all`. A press elsewhere, or the wait, takes the question back.
  */
 async function press($: EngineInterface, what: number | 'all', list: () => Group[]) {
   if (armed !== what) {
@@ -262,10 +176,10 @@ async function press($: EngineInterface, what: number | 'all', list: () => Group
   }
   armed = null
   await stop($, list())
+  if (detail !== null && !groups.some(g => g.pid === detail)) detail = null
   // The row that held the ring is gone: hand the ring to the first one left.
-  const next = SECTIONS.filter(section => section.kind !== 'mcp' || showsMcp).flatMap(section => visible(section.kind))[0]
+  const next = shown(groups, showsMcp)[0]
   if (!next || !isPaneOpen) return
-  // once the list has been drawn again without the ended row
   $.clock.after(250, async () => {
     const key = `row-${next.pid}`
     const moved = await $.ui.focus({ requestId: PANE, key }).catch(err => ({ deny: String(err) }))
@@ -276,112 +190,41 @@ async function press($: EngineInterface, what: number | 'all', list: () => Group
   })
 }
 
-/** The emoji that carries each kind's color where text has none of its own (markdown). */
-const DOT: Record<Kind, string> = { orphan: '🟡', detached: '🔵', running: '🟢', mcp: '⚪' }
+/** The numbered list, remembered so the transcript can draw it and a number can name a row. */
+function listing() {
+  const list = listText(groups, me)
+  order = list.order
+  printed.set(list.text, { groups: shown(groups, false), order: list.order })
+  if (printed.size > 12) printed.delete(printed.keys().next().value ?? '')
 
-const cut = (text: string, width: number) => (text.length > width ? text.slice(0, width - 1) + '…' : text)
-// Words that stay on one line when a narrow table folds its cells.
-const together = (text: string) => text.replace(/ /g, ' ')
-// A table cell: a pipe would end it, and markdown's marks would be read as marks.
-const plain = (text: string) => text.replace(/[\\`*_[\]<>|~]/g, '\\$&')
-const code = (text: string) => {
-  const ticks = '`'.repeat(Math.max(0, ...(text.match(/`+/g) ?? []).map(run => run.length)) + 1)
-  const pad = text.startsWith('`') || text.endsWith('`') ? ' ' : ''
-
-  return `${ticks}${pad}${text.replace(/\|/g, '\\|')}${pad}${ticks}`
-}
-
-/**
- * The list as markdown, for where a command's answer is drawn as a reply is
- * (the editor's panel): one table, each group named on its first row. Columns
- * padded with spaces do not line up there, the font is not monospace.
- */
-export function table(list: Group[], session: string) {
-  const sections = SECTIONS.map(section => ({ ...section, rows: list.filter(g => g.kind === section.kind) })).filter(
-    section => section.rows.length > 0,
-  )
-  if (sections.length === 0) return ''
-  const held = list.filter(g => g.kind === 'orphan' || g.kind === 'detached').reduce((sum, g) => sum + g.rssKb, 0)
-  const counts = sections.map(section => `**${section.rows.length}** ${section.title.toLowerCase()}`)
-  if (held > 0) counts.push(`**${megabytes(held)}** held`)
-  const rows = sections.flatMap(section =>
-    section.rows.map((g, i) => {
-      const ports = g.ports.slice(0, 3).map(p => `:${p}`)
-      if (g.ports.length > 3) ports.push(`+${g.ports.length - 3}`)
-      const size = together(megabytes(g.rssKb))
-
-      return [
-        i === 0 ? together(`${DOT[section.kind]} **${section.title}**`) : '',
-        ports.join(' '),
-        code(cut(g.label, 56)) + (g.sid === session && g.kind !== 'orphan' ? ' _this session_' : ''),
-        plain(basename(g.cwd) || '/'),
-        together(age(g.seconds)),
-        // what the pane's memory bar draws in yellow or red
-        g.rssKb > 300 * 1024 ? `**${size}**` : size,
-      ]
-    }),
-  )
-
-  return [
-    counts.join(' · '),
-    '',
-    '| | Port | Command | Folder | Running | Memory |',
-    '| :- | :- | :- | :- | -: | -: |',
-    ...rows.map(cells => `| ${cells.join(' | ')} |`),
-    ...(sections.some(section => section.kind === 'orphan') ? ['', '`/strays kill` ends what was left behind.'] : []),
-  ].join('\n')
-}
-
-// MCP servers belong to sessions that are open: the pane shows them on request, the text never.
-const listing = (isMarkdown: boolean) => {
-  const shown = SECTIONS.filter(s => s.kind !== 'mcp').flatMap(s => visible(s.kind))
-  if (isMarkdown) return table(shown, me)
-  const w = widths(shown, 100)
-
-  return SECTIONS.filter(s => s.kind !== 'mcp')
-    .map(section => ({ ...section, rows: visible(section.kind) }))
-    .filter(section => section.rows.length > 0)
-    .map(section =>
-      [
-        `${section.title} (${section.why})`,
-        ...section.rows.map(g => `  ${line(g, w).trimEnd()}${g.sid === me && g.kind !== 'orphan' ? '  this session' : ''}`),
-      ].join('\n'),
-    )
-    .join('\n\n')
-}
-
-/**
- * Whether a command's answer is drawn as markdown here, in a font that is not
- * monospace: the editor's panel, and a session no terminal draws.
- */
-async function drawsMarkdown($: EngineInterface) {
-  const entry = await $.env.get('CLAUDE_CODE_ENTRYPOINT').catch(() => undefined)
-  if (entry === 'claude-vscode') return true
-  const surfaces = await $.session.surfaces()
-
-  return surfaces.length > 0 && !surfaces.includes('terminal')
+  return list.text
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    try {
-      await $.command.register({
-        name: 'strays',
-        description: 'Processes Claude Code started and left running, in any session: see them, end them',
-        argumentHint: '[list | kill]',
-        immediate: true,
-      })
-    } catch (err) {
-      $.ui.log(`/strays was not added: ${String(err)}`)
+    for (const name of COMMANDS) {
+      try {
+        await $.command.register({
+          name,
+          description:
+            name === 'strays'
+              ? 'Processes Claude Code started and left running: list them, see one in full, end it'
+              : 'Short for /strays: processes Claude Code left running',
+          argumentHint: '[number | :port | kill <number|all> | ui | help]',
+          immediate: true,
+        })
+      } catch (err) {
+        $.ui.log(`/${name} was not added: ${String(err)}`, { to: 'debug' })
+      }
     }
     me = await $.session.id()
-    // Off the session's start: look once now, then every half minute, or every five seconds while the pane is open.
+    // Off the session's start: look once now, then every half minute, or every five seconds while the panel is open.
     $.clock.after(0, async () => {
       await scan($)
       const left = orphans()
       if (left.length > 0) {
         const size = megabytes(left.reduce((sum, g) => sum + g.rssKb, 0))
-        $.ui.toast(`${plural(left.length, 'process')} from earlier Claude Code sessions still running (${size}): /strays`)
+        $.ui.toast(`👻 ${plural(left.length, 'process')} from earlier Claude Code sessions still running (${size}): /strays`)
       }
     })
     $.clock.every(5000, () => {
@@ -392,38 +235,68 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('command.run', { command: 'strays' }, async ($, e) => {
-    const arg = e.args.trim()
-    if (arg === 'list' || arg === 'kill') {
-      await scan($)
-      const isMarkdown = await drawsMarkdown($)
-      if (arg === 'kill') {
-        const ended = await stop($, orphans())
+  on('command.run', { command: ['strays', 'ps'] }, async ($, e) => {
+    const ask = parseArgs(e.args)
+    if (ask.verb === 'help') return { text: HELP }
+    await scan($)
+    // A number names a row of the last list; before any list was printed here, of the list as it stands.
+    if (order.length === 0) order = listText(groups, me).order
 
-        return {
-          text: `Ended ${plural(ended, 'process')} whose session was closed.\n\n${listing(isMarkdown) || 'Nothing else is running.'}`,
-        }
+    if (ask.verb === 'ui') {
+      const surfaces = await $.session.surfaces()
+      if (!surfaces.some(surface => surface === 'terminal' || surface === 'desktop')) {
+        return { text: `The panel draws in the terminal and the desktop app. Here it is as a list:\n\n${listing()}` }
       }
+      isPaneOpen = true
+      note = ''
+      armed = null
+      detail = null
+      openedAt = frame
+      await $.ui.open({ id: PANE, title: 'Strays', focus: true, rows: 16, columns: 90 })
+      animate($, GROW + 2)
 
-      return { text: listing(isMarkdown) || 'No process started by Claude Code is running.' }
+      return {}
     }
-    isPaneOpen = true
-    note = ''
-    armed = null
-    await $.ui.open({ id: PANE, title: 'Strays', focus: true, rows: 16, columns: 90 })
-    void scan($)
 
-    return {}
+    if (ask.verb === 'info') {
+      const g = resolve(ask.target, groups, order)
+      if (!g) return { text: `Nothing matches ${ask.target || 'that'}.\n\n${listing()}` }
+
+      return { text: detailText(g, await loadInfo($, g), order.indexOf(g.pid) + 1) }
+    }
+
+    if (ask.verb === 'kill') {
+      if (ask.target === '') {
+        return { text: `Which one? /strays kill 2 ends row 2, /strays kill all ends every left-behind one.\n\n${listing()}` }
+      }
+      const list =
+        ask.target === 'all' ? orphans() : [resolve(ask.target, groups, order)].filter((g): g is Group => g !== undefined)
+      if (list.length === 0) {
+        return { text: `${ask.target === 'all' ? 'Nothing is left behind.' : `Nothing matches ${ask.target}.`}\n\n${listing()}` }
+      }
+      const names = list.map(g => `${g.icon} ${g.label}${portsText(g) ? ` (${portsText(g)})` : ''}`)
+      const ended = await stop($, list)
+
+      return {
+        text:
+          ended > 0
+            ? `Ended ${names.join(', ')}: ${plural(ended, 'process')}.\n\n${listing()}`
+            : `Nothing was ended: ${names.join(', ')} had already gone or changed.\n\n${listing()}`,
+      }
+    }
+
+    return { text: listing() }
   })
 
   on('ui.close', { id: PANE }, async ($, e, next) => {
     isPaneOpen = false
     armed = null
+    detail = null
 
     return next(e)
   })
 
-  // The ring moved: the row that holds it is the one drawn as chosen.
+  // The ring moved: the control that holds it is the one drawn as chosen.
   on('ui.focus', { requestId: PANE }, async ($, e, next) => {
     const moved = await next(e)
     if (!moved.deny && (e.element ?? '') !== focused) {
@@ -434,44 +307,66 @@ export const register: Register = on => {
     return moved
   })
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
-    const sections = SECTIONS.filter(s => s.kind !== 'mcp' || showsMcp)
-      .map(section => ({ ...section, rows: visible(section.kind) }))
-      .filter(section => section.rows.length > 0)
-    const rows = sections.flatMap(section => section.rows)
-    const gone = orphans()
-    const loose = visible('detached')
-    const left = strays()
-    const hidden = showsMcp ? 0 : visible('mcp').length
-    const first = rows[0]?.pid
-    const columns = e.props.bodyColumns
-    const isWide = columns >= 72
-    const portWidth = Math.min(12, Math.max(5, ...rows.map(g => portsText(g).length)))
-    const biggest = Math.max(256 * 1024, ...rows.map(g => g.rssKb))
-    const folderWidth = Math.min(10, Math.max(3, ...rows.map(g => (basename(g.cwd) || '/').length)))
-    // The command takes what the fixed columns leave, within bounds: a long
-    // command is cut, so it never widens the pane over the transcript.
-    // Beside the transcript the pane is as wide as its content asks, so the
-    // list keeps to about ninety columns there whatever room there is.
-    const fixed = 1 + (portWidth + 2) + 15 + (8 + folderWidth) + 7 + 5 + 4
-    const nameWidth = e.props.placement === 'dock' ? 38 - portWidth : Math.min(64, Math.max(14, columns - fixed))
-    // A frame hugs its rows (the widest, with the question's longer button) and stops at the pane's edge.
-    const frameWidth = Math.min(columns, 1 + (portWidth + 2) + nameWidth + 15 + (8 + folderWidth) + 15 + 5 + 4)
+  // The list a command printed, drawn in the transcript in color: the same rows, numbered.
+  on('ui.render', { component: 'CommandOutput' }, async ($, e, next) => {
+    // The output may carry words before the list ("Ended …"), and the plugin's name before those.
+    const text = COMMANDS.includes(e.props.command) ? e.props.text : ''
+    const key = [...printed.keys()].reverse().find(known => text.includes(known))
+    const list = key === undefined ? undefined : printed.get(key)
+    if (key === undefined || !list || list.groups.length === 0) return next(e)
+    const before = text
+      .slice(0, text.indexOf(key))
+      .replace(/^strays:\s*/, '')
+      .trim()
+    const { Box, Text } = $.ui.resolve(e)
+    const portWidth = Math.min(12, Math.max(5, ...list.groups.map(g => portsText(g).length)))
+    const nameWidth = Math.min(48, Math.max(16, ...list.groups.map(g => g.label.length)))
+    const digits = String(list.groups.length).length
 
-    // A number over its name, in a frame the color of what it counts.
-    const tile = (value: string, name: string, color: string, isLit: boolean) => (
-      <Box flexDirection="column" borderStyle="round" borderColor={color} borderDimColor={!isLit} paddingX={1} width={18}>
-        <Text bold color={isLit ? color : undefined} dimColor={!isLit}>
-          {value}
-        </Text>
-        <Text dimColor>{name}</Text>
+    return (
+      <Box flexDirection="column">
+        {before !== '' && <Text>{before}</Text>}
+        {SECTIONS.map(section => ({ ...section, rows: list.groups.filter(g => g.kind === section.kind) }))
+          .filter(section => section.rows.length > 0)
+          .map(section => (
+            <Box flexDirection="column">
+              <Box flexDirection="row" columnGap={1}>
+                <Text bold color={ACCENT[section.kind]}>
+                  {`${section.icon} ${section.title}`}
+                </Text>
+                <Text dimColor>{section.why}</Text>
+              </Box>
+              {section.rows.map(g => (
+                <Box flexDirection="row" columnGap={1}>
+                  <Text dimColor>{`  ${String(list.order.indexOf(g.pid) + 1).padStart(digits)}`}</Text>
+                  {portsText(g) ? (
+                    <Text backgroundColor={ACCENT[g.kind]} color="black" bold>
+                      {` ${fit(portsText(g), portWidth)} `}
+                    </Text>
+                  ) : (
+                    <Text dimColor>{` ${fit('·', portWidth)} `}</Text>
+                  )}
+                  <Text bold={g.kind === 'orphan'}>{`${g.icon} ${fit(g.label, nameWidth)}`}</Text>
+                  <Text dimColor>{`${megabytes(g.rssKb).padStart(7)}  ${age(g.seconds).padStart(6)}  ${basename(g.cwd) || '/'}`}</Text>
+                </Box>
+              ))}
+            </Box>
+          ))}
+        <Text dimColor>/strays 1 shows one in full · /strays kill 1 ends it · /strays ui opens the panel</Text>
       </Box>
     )
+  })
 
-    // Memory as a bar: eight cells against the heaviest process here (256 MB at least).
-    const meter = (g: Group) => {
-      const filled = Math.max(1, Math.round((g.rssKb / biggest) * 8))
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const columns = e.props.bodyColumns
+    const isDocked = e.props.placement === 'dock'
+    const grow = Math.min(1, (frame - openedAt + 1) / GROW)
+    const spinner = frame < spinUntil || isScanning || ending.size > 0 ? (SPIN[frame % SPIN.length] ?? '') : ' '
+
+    // Memory as a bar: eight cells against the heaviest here (256 MB at least), growing in as the panel opens.
+    const meter = (g: Group, biggest: number) => {
+      const filled = Math.max(1, Math.round((g.rssKb / biggest) * 8 * grow))
       const color = g.rssKb > 1024 * 1024 ? 'red' : g.rssKb > 300 * 1024 ? 'yellow' : 'green'
 
       return (
@@ -489,17 +384,149 @@ export const register: Register = on => {
       )
     }
 
+    const chosen = detail === null ? undefined : groups.find(g => g.pid === detail)
+    if (chosen) {
+      // One group in full.
+      const color = ACCENT[chosen.kind]
+      const data = info?.pid === chosen.pid ? info.data : null
+      const isAsked = armed === chosen.pid
+      const isEnding = ending.has(chosen.pid)
+      const port = chosen.ports[0]
+      const labelWidth = 11
+      const cardWidth = Math.min(columns, 100)
+      const valueWidth = Math.max(20, cardWidth - labelWidth - 4)
+
+      return (
+        <Box flexDirection="column" rowGap={1}>
+          <Box flexDirection="row" columnGap={1}>
+            <Button key="back" label="← Back" hotkey="b" dimColor onPress={() => view($, null)} />
+            <Text color={color}>{spinner}</Text>
+          </Box>
+          <Box flexDirection="row" columnGap={1}>
+            {portsText(chosen) !== '' && (
+              <Text backgroundColor={color} color="black" bold>
+                {` ${portsText(chosen)} `}
+              </Text>
+            )}
+            <Text bold wrap="truncate-end">{`${chosen.icon} ${chosen.label}`}</Text>
+          </Box>
+          <Box flexDirection="column" borderStyle="round" borderColor={color} paddingX={1} width={cardWidth}>
+            {facts(chosen, data).map(([label, value]) => (
+              <Box flexDirection="row">
+                <Box flexShrink={0} width={labelWidth}>
+                  <Text dimColor>{label}</Text>
+                </Box>
+                <Box flexDirection="column" width={valueWidth}>
+                  {label === 'Memory' ? (
+                    <Box flexDirection="row" columnGap={1}>
+                      {meter(chosen, Math.max(256 * 1024, chosen.rssKb))}
+                      <Text dimColor wrap="truncate-end">
+                        {value.slice(megabytes(chosen.rssKb).length)}
+                      </Text>
+                    </Box>
+                  ) : (
+                    value.split('\n').map(text => (
+                      <Text wrap="wrap" color={label === 'State' ? color : undefined}>
+                        {text}
+                      </Text>
+                    ))
+                  )}
+                </Box>
+              </Box>
+            ))}
+          </Box>
+          {note !== '' && <Text color="green">{`✓ ${note}`}</Text>}
+          <Box flexDirection="row" columnGap={2} flexWrap="wrap">
+            {isEnding ? (
+              <Text color="red">{`${spinner} ending…`}</Text>
+            ) : (
+              <Button
+                key="end"
+                label={isAsked ? 'Yes, end it' : 'End process'}
+                hotkey="e"
+                variant="primary"
+                onPress={() => press($, chosen.pid, () => groups.filter(g => g.pid === chosen.pid))}
+              />
+            )}
+            <Button
+              key="folder"
+              label="Open folder"
+              hotkey="f"
+              onPress={async () => {
+                await $.process.run(['open', data?.fields.cwd || chosen.cwd])
+              }}
+            />
+            {port !== undefined && (
+              <Button
+                key="browser"
+                label={`Open :${port}`}
+                hotkey="o"
+                onPress={async () => {
+                  await $.process.run(['open', `http://localhost:${port}`])
+                }}
+              />
+            )}
+            <Button
+              key="copy"
+              label="Copy command"
+              hotkey="c"
+              onPress={async pressed => {
+                await $.ui.copy({ text: data?.fields.command || chosen.command, surface: pressed.surface })
+                note = 'command copied'
+                redraw($)
+              }}
+            />
+          </Box>
+          <Text dimColor>click a button · b back · e end · f folder · c copy · Esc to the prompt</Text>
+        </Box>
+      )
+    }
+
+    // The list.
+    const sections = SECTIONS.filter(s => s.kind !== 'mcp' || showsMcp)
+      .map(section => ({ ...section, rows: visible(groups, section.kind) }))
+      .filter(section => section.rows.length > 0)
+    const rows = sections.flatMap(section => section.rows)
+    const gone = orphans()
+    const loose = visible(groups, 'detached')
+    const left = strays()
+    const hidden = showsMcp ? 0 : visible(groups, 'mcp').length
+    const first = rows[0]?.pid
+    const isWide = columns >= 72
+    const portWidth = Math.min(12, Math.max(5, ...rows.map(g => portsText(g).length)))
+    const biggest = Math.max(256 * 1024, ...rows.map(g => g.rssKb))
+    const folderWidth = Math.min(10, Math.max(3, ...rows.map(g => (basename(g.cwd) || '/').length)))
+    // Beside the transcript the panel is as wide as its content asks, so the
+    // list keeps to about ninety columns there whatever room there is.
+    const fixed = 1 + (portWidth + 2) + 15 + (8 + folderWidth) + 7 + 5 + 4
+    const nameWidth = isDocked ? 46 - portWidth : Math.min(64, Math.max(14, columns - fixed))
+    // A frame hugs its rows (the widest, with the question's longer button) and stops at the panel's edge.
+    const frameWidth = Math.min(columns, 1 + (portWidth + 2) + nameWidth + 15 + (8 + folderWidth) + 15 + 5 + 4)
+    const memory = megabytes(left.reduce((sum, g) => sum + g.rssKb, 0))
+
+    // A number over its name, in a frame the color of what it counts.
+    const tile = (icon: string, value: string, name: string, color: string, isLit: boolean) => (
+      <Box flexDirection="column" borderStyle="round" borderColor={color} borderDimColor={!isLit} paddingX={1} width={19}>
+        <Text bold color={isLit ? color : undefined} dimColor={!isLit}>
+          {`${icon} ${value}`}
+        </Text>
+        <Text dimColor>{name}</Text>
+      </Box>
+    )
+
     const item = (g: Group) => {
       const color = ACCENT[g.kind]
-      const key = `row-${g.pid}`
-      const isChosen = focused === key
+      const rowKey = `row-${g.pid}`
+      const endKey = `end-${g.pid}`
+      const isChosen = focused === rowKey || focused === endKey
       const isAsked = armed === g.pid
+      const isEnding = ending.has(g.pid)
       const port = portsText(g)
-      // Everything but the command keeps its width: the command gives way and is cut with an ellipsis.
+      // Everything but the command keeps its width: the command is cut with an ellipsis.
       const mark = (
         <Box flexShrink={0}>
           <Text bold color={color}>
-            {isChosen ? '❯' : ' '}
+            {isEnding ? (SPIN[frame % SPIN.length] ?? ' ') : isChosen ? '❯' : ' '}
           </Text>
         </Box>
       )
@@ -516,67 +543,77 @@ export const register: Register = on => {
           )}
         </Box>
       )
+      const width = isWide ? nameWidth : Math.max(14, columns - portWidth - 10)
+      // The row itself is the control: a click, or Enter, shows the process in full.
       const name = (
         <Box flexShrink={0}>
-          <Text bold={isChosen || g.kind === 'orphan'} color={isAsked ? 'red' : undefined} wrap="truncate">
-            {fit(isAsked ? `End ${g.label}?` : g.label, isWide ? nameWidth : Math.max(14, columns - portWidth - 10))}
-          </Text>
+          <Button
+            key={rowKey}
+            plain
+            label={`${g.icon} ${fit(isAsked ? `End ${g.label}?` : g.label, width - 3)}`}
+            hover={{ underline: true, bold: true }}
+            dimColor={isEnding || g.kind === 'mcp'}
+            {...(g.pid === first ? { autoFocus: true as const } : {})}
+            onPress={() => view($, g.pid)}
+          />
         </Box>
       )
-      const facts = (
+      const about = (
         <Box flexShrink={0}>
           <Text dimColor wrap="truncate">
             {`${age(g.seconds).padStart(6)}  ${fit(basename(g.cwd) || '/', folderWidth)}`}
           </Text>
         </Box>
       )
-      // The one control of the row: the arrows land on it, Enter asks, Enter again ends.
       const button = (
         <Box flexShrink={0}>
-        <Button
-          key={key}
-          label={isAsked ? 'Yes, end it' : 'End'}
-          {...(isAsked ? { variant: 'primary' as const } : {})}
-          {...(g.pid === first ? { autoFocus: true as const } : {})}
-          onPress={() => press($, g.pid, () => groups.filter(x => x.pid === g.pid))}
-        />
+          {isEnding ? (
+            <Text color="red">ending…</Text>
+          ) : (
+            <Button
+              key={endKey}
+              label={isAsked ? 'Yes, end it' : 'End'}
+              {...(isAsked ? { variant: 'primary' as const } : {})}
+              onPress={() => press($, g.pid, () => groups.filter(x => x.pid === g.pid))}
+            />
+          )}
         </Box>
       )
+      // The row's Box has a key, so the pointer anywhere on the row lights its name.
       if (isWide) {
         return (
-          <Box flexDirection="row" columnGap={1}>
+          <Box key={`item-${g.pid}`} flexDirection="row" columnGap={1}>
             {mark}
             {pill}
             {name}
-            {meter(g)}
-            {facts}
+            {meter(g, biggest)}
+            {about}
             {button}
           </Box>
         )
       }
 
-      // A narrow pane (docked beside the transcript): the same row on two lines.
+      // A narrow panel: the same row on two lines.
       return (
-        <Box flexDirection="column">
+        <Box key={`item-${g.pid}`} flexDirection="column">
           <Box flexDirection="row" columnGap={1}>
             {mark}
             {pill}
             {name}
           </Box>
           <Box flexDirection="row" columnGap={1} paddingLeft={2}>
-            {meter(g)}
-            {facts}
+            {meter(g, biggest)}
+            {about}
             {button}
           </Box>
         </Box>
       )
     }
 
-    const memory = megabytes(left.reduce((sum, g) => sum + g.rssKb, 0))
     const title = (section: (typeof sections)[number]) => (
       <Box flexDirection="row" columnGap={1}>
         <Text bold color={ACCENT[section.kind]}>
-          {`● ${section.title}`}
+          {`${section.icon} ${section.title}`}
         </Text>
         <Text dimColor>{section.why}</Text>
       </Box>
@@ -592,7 +629,17 @@ export const register: Register = on => {
             onPress={() => press($, 'all', orphans)}
           />
         )}
-        <Button key="refresh" label="Refresh" hotkey="r" dimColor onPress={() => scan($)} />
+        <Button
+          key="refresh"
+          label="Refresh"
+          hotkey="r"
+          dimColor
+          onPress={async () => {
+            spinUntil = frame + 6
+            animate($, 6)
+            await scan($)
+          }}
+        />
         <Button
           key="mcp"
           label={showsMcp ? 'Hide MCP' : `MCP${hidden > 0 ? ` (${hidden})` : ''}`}
@@ -604,15 +651,18 @@ export const register: Register = on => {
           }}
         />
         <Button key="close" label="Close" hotkey="x" dimColor role="dismiss" onPress={() => $.ui.close({ id: PANE })} />
+        <Text color="cyan">{spinner}</Text>
       </Box>
     )
-    const hint = <Text dimColor>{`↑↓ move   ⏎ end   ${gone.length > 0 ? 'o end all   ' : ''}r refresh   m MCP   x close`}</Text>
+    const hint = (
+      <Text dimColor>{`click a row for details · click End to end it · ↑↓ ⏎ work too${gone.length > 0 ? ' · o ends all left behind' : ''}`}</Text>
+    )
     const done = note !== '' && <Text color="green">{`✓ ${note}`}</Text>
 
-    // Above the prompt a pane is wide and short: the counts become one line of
+    // Above the prompt a panel is wide and short: the counts become one line of
     // labels, the actions sit under them where they are never cut off, and the
     // groups lose their frames.
-    if (e.props.placement === 'inline') {
+    if (!isDocked) {
       const badge = (text: string, color: string, isLit: boolean) =>
         isLit ? (
           <Text backgroundColor={color} color="black" bold>
@@ -627,13 +677,13 @@ export const register: Register = on => {
           <Box flexDirection="row" columnGap={1}>
             {rows.length === 0 && left.length === 0 ? (
               <Text bold color="green">
-                ✓ All clean: nothing Claude Code started is still running
+                ✨ All clean: nothing Claude Code started is still running
               </Text>
             ) : (
               <Box flexDirection="row" columnGap={1}>
-                {badge(`${gone.length} left behind`, ACCENT.orphan, gone.length > 0)}
-                {badge(`${loose.length} in background`, ACCENT.detached, loose.length > 0)}
-                {badge(`${memory} held`, 'magenta', left.length > 0)}
+                {badge(`👻 ${gone.length} left behind`, ACCENT.orphan, gone.length > 0)}
+                {badge(`🌙 ${loose.length} in background`, ACCENT.detached, loose.length > 0)}
+                {badge(`💾 ${memory} held`, 'magenta', left.length > 0)}
               </Box>
             )}
             {done}
@@ -653,14 +703,14 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" rowGap={1}>
         <Box flexDirection="row" columnGap={1}>
-          {tile(String(gone.length), 'left behind', ACCENT.orphan, gone.length > 0)}
-          {tile(String(loose.length), 'in background', ACCENT.detached, loose.length > 0)}
-          {tile(memory.split(' ')[0] ?? '', `${memory.split(' ')[1] ?? 'MB'} held`, 'magenta', left.length > 0)}
+          {tile('👻', String(gone.length), 'left behind', ACCENT.orphan, gone.length > 0)}
+          {tile('🌙', String(loose.length), 'in background', ACCENT.detached, loose.length > 0)}
+          {tile('💾', memory, 'memory held', 'magenta', left.length > 0)}
         </Box>
         {rows.length === 0 && (
           <Box borderStyle="round" borderColor="green" paddingX={2} flexDirection="column">
             <Text bold color="green">
-              ✓ All clean
+              ✨ All clean
             </Text>
             <Text dimColor>Nothing Claude Code started is still running.</Text>
           </Box>

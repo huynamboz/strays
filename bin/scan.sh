@@ -1,21 +1,33 @@
 #!/bin/sh
 # strays: lists the processes Claude Code sessions started that still run.
 #
-# Claude Code marks every process it starts with CLAUDECODE=1 and the id of its
-# session in the environment, and a process keeps its environment after the
-# session that started it is gone. A process under a running session is listed
-# by its place in the tree, marked or not. One line per process, tab-separated:
-#   pid ppid seconds rssKB sessionId claudePid alive attached ports cwd command
-# alive: the session that started it still runs. attached: it still hangs under
-# that session (a process started with nohup or & is alive but not attached).
+# A process is listed when one of four things ties it to Claude Code (column
+# `how`), whether or not the session that started it is still there:
+#   e  it carries CLAUDECODE=1 in its environment: Claude Code marks every
+#      process it starts, and a process keeps its environment for life
+#   w  it is the shell the Bash tool wraps a command in (its command line names
+#      ~/.claude/shell-snapshots); macOS shows no environment for its own
+#      programs (sh, zsh, tail, nc, ssh), so the command line stands in
+#   t  it hangs under a running session, or under such a shell, in the tree
+#   g  it shares a process group with a marked process whose group leader is
+#      gone or marked too: one Bash call starts one group, and `nohup tail &`
+#      stays in it after the shell that started it exits
+#
+# One line per process, tab-separated:
+#   pid up seconds rssKB sessionId claudePid alive attached ports cwd how pgid cpu start command
+# up: the nearest listed ancestor (its parent, for grouping). alive: the session
+# that started it still runs. attached: it still hangs under that session.
+# start: when it started, in epoch seconds (what bin/kill.sh checks a pid against).
 set -u
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/strays.XXXXXX") || exit 1
 trap 'rm -rf "$tmp"' EXIT
 
-ps -axww -o pid=,ppid=,etime=,rss=,command= > "$tmp/all"
+ps -axww -o pid=,ppid=,pgid=,etime=,rss=,pcpu=,command= > "$tmp/all"
 ps -axEww -o pid=,command= > "$tmp/env"
+# Claude Code keeps one file per running session, named for its pid.
+sessions=$(ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions" 2>/dev/null | sed -n 's/^\([0-9][0-9]*\)\.json$/\1/p' | tr '\n' ' ')
 
-awk -v self=$$ '
+awk -v self=$$ -v now="$(date +%s)" -v sessions="$sessions" '
 function seconds(e,   n, p, d) {
   d = 0
   if (index(e, "-")) { d = substr(e, 1, index(e, "-") - 1); e = substr(e, index(e, "-") + 1) }
@@ -30,22 +42,31 @@ function last(s, re, skip,   out) {
   while (match(s, re)) { out = substr(s, RSTART + skip, RLENGTH - skip); s = substr(s, RSTART + RLENGTH) }
   return out
 }
+# A Claude Code session: registered as one, or named as one.
 function claude(pid,   first, n, parts) {
+  if (!(pid in parent)) return 0
+  if (pid in registered) return 1
   n = split(cmd[pid], parts, " ")
   first = parts[1]
   return first == "claude" || first ~ /\/claude$/ || cmd[pid] ~ /claude-code\/cli\.js/
+}
+BEGIN {
+  n = split(sessions, list, " ")
+  for (i = 1; i <= n; i++) registered[list[i]] = 1
 }
 # A command may hold line breaks, and ps prints them as they are: a line that
 # does not open a new record continues the one before it.
 # First file: every process, for the family tree and the command as typed.
 FNR == NR {
-  if ($0 ~ /^ *[0-9]+ +[0-9]+ +([0-9]+-)?([0-9]+:)?[0-9]+:[0-9]+ +[0-9]+ /) {
+  if ($0 ~ /^ *[0-9]+ +[0-9]+ +[0-9]+ +([0-9]+-)?([0-9]+:)?[0-9]+:[0-9]+ +[0-9]+ +[0-9.,]+ /) {
     pid = $1
     parent[pid] = $2
-    age[pid] = seconds($3)
-    rss[pid] = $4
+    pgid[pid] = $3
+    age[pid] = seconds($4)
+    rss[pid] = $5
+    cpu[pid] = $6
     line = $0
-    sub(/^ *[0-9]+ +[0-9]+ +[^ ]+ +[0-9]+ +/, "", line)
+    sub(/^ *[0-9]+ +[0-9]+ +[0-9]+ +[^ ]+ +[0-9]+ +[0-9.,]+ +/, "", line)
   } else {
     line = cmd[pid] " " $0
   }
@@ -53,7 +74,7 @@ FNR == NR {
   cmd[pid] = line
   next
 }
-# Second file: the environments. Remember who carries the marker, and whose it is.
+# Second file: the environments. Remember who carries the mark, and whose it is.
 {
   if ($0 ~ /^ *[0-9]+ / && ($1 in parent)) pid = $1
   if (index($0, " CLAUDECODE=1")) marked[pid] = 1
@@ -63,36 +84,54 @@ FNR == NR {
   if (found != "") cpid[pid] = found
 }
 END {
-  # Kept: a process that carries the mark, and one that hangs under a running
-  # session whatever it carries (macOS shows no environment for its own
-  # programs: sh, tail, nc, ssh, so their place in the tree is all there is).
   for (pid in parent) {
-    # What the Bash tool runs sits under its shell wrapper; what a session
-    # starts for itself (an MCP server, a helper) is its direct child.
-    mine = 0; att = 0; own = ""; p = pid
-    bash = (cmd[pid] ~ /\/shell-snapshots\//)
+    if (cmd[pid] ~ /\/\.claude\/shell-snapshots\//) wrapper[pid] = 1
+    # A process that has exited and waits to be reaped holds nothing and cannot be ended.
+    if (cmd[pid] ~ /^(<defunct>|\([^)]*\))$/) mine[pid] = 1
+  }
+
+  # By mark, by wrapper, by place in the tree.
+  for (pid in parent) {
+    # What the Bash tool runs sits under its wrapper; what a session starts for
+    # itself (an MCP server, a helper) is its direct child.
+    att = 0; own = ""; under = 0; p = pid
+    bash = (pid in wrapper)
     for (i = 0; i < 64 && p > 1; i++) {
-      if (p == self) { mine = 1; break }   # this scan and its helpers
+      if (p == self) { mine[pid] = 1; break }   # this scan and its helpers
       p = parent[p]
       if (p == "") break
       if (claude(p)) { att = 1; if (own == "") own = p }
-      else if (own == "" && cmd[p] ~ /\/shell-snapshots\//) bash = 1
+      else if (p in wrapper) { under = 1; if (own == "") bash = 1 }
     }
-    if (mine || (!(pid in marked) && !att)) continue
-    keep[pid] = 1; attached[pid] = att; owner[pid] = bash ? own : ""
+    if (pid in mine) continue
+    how[pid] = (pid in marked) ? "e" : (pid in wrapper) ? "w" : (att || under) ? "t" : ""
+    if (how[pid] == "") continue
+    attached[pid] = att
+    # Whose it is: the pid its mark names, else the session it sits under through a wrapper.
+    c[pid] = (pid in cpid) ? cpid[pid] : ((pid in marked) ? "" : (bash ? own : ""))
+    if (how[pid] != "t" && !(pgid[pid] in member)) member[pgid[pid]] = pid
   }
-  for (pid in keep) {
-    # Its parent, for grouping: the nearest ancestor that is kept too, so
+  # By process group: what a marked process left its group with.
+  for (pid in parent) {
+    if ((pid in how && how[pid] != "") || (pid in mine) || claude(pid)) continue
+    g = pgid[pid]
+    if (!(g in member) || g == pid) continue
+    if ((g in parent) && !(g in how && how[g] != "")) continue   # the leader lives and is not ours
+    m = member[g]
+    how[pid] = "g"; attached[pid] = 0; c[pid] = c[m]; sid[pid] = sid[m]
+  }
+  for (pid in how) {
+    if (how[pid] == "") continue
+    # Its parent, for grouping: the nearest ancestor that is listed too, so
     # `npm run dev` holds the server it started through a shell in between.
     up = parent[pid]; p = parent[pid]
     for (i = 0; i < 64 && p > 1; i++) {
-      if (p in keep) { up = p; break }
+      if ((p in how) && how[p] != "") { up = p; break }
       p = parent[p]
       if (p == "") break
     }
-    c = (pid in cpid) ? cpid[pid] : ((pid in marked) ? "" : owner[pid])
-    alive = attached[pid] || (c != "" && (c in parent) && claude(c))
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n", pid, up, age[pid], rss[pid], sid[pid], c, alive, attached[pid], cmd[pid]
+    alive = attached[pid] || (c[pid] != "" && claude(c[pid]))
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%d\t%s\n", pid, up, age[pid], rss[pid], sid[pid], c[pid], alive, attached[pid], how[pid], pgid[pid], cpu[pid], now - age[pid], cmd[pid]
   }
 }' "$tmp/all" "$tmp/env" > "$tmp/rows"
 
@@ -115,5 +154,5 @@ FILENAME == ARGV[2] {
   else if ($0 ~ /^n/) cwd[pid] = substr($0, 2)
   next
 }
-{ printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4, $5, $6, $7, $8, ports[$1], cwd[$1], $9 }
+{ printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4, $5, $6, $7, $8, ports[$1], cwd[$1], $9, $10, $11, $12, $13 }
 ' "$tmp/ports" "$tmp/cwds" "$tmp/rows"
