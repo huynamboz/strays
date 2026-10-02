@@ -34,10 +34,18 @@ claude --plugin-dir /path/to/strays
 | `/strays :3000` | the same, for whatever listens on port 3000 |
 | `/strays kill 2` | ends row 2 and everything it started (also `k`, `end`, `stop`; a pid or `:port` names one too) |
 | `/strays kill all` | ends every left-behind one |
+| `/strays copy 2` | copies row 2's whole command to the clipboard (also `c`, `cp`) |
 | `/strays ui` | the panel, in the terminal and the desktop app (also `u`, `open`) |
 | `/strays help` | this table |
 
 `/ps` is the same command, shorter: `/ps`, `/ps 2`, `/ps k 2`.
+
+In the VS Code panel, where text is not monospace and padded columns would not
+line up, the list, one process in full and the help are drawn as tables: a port
+is a link that opens it in the browser, memory is a bar as well as a number, and
+the transcript of the session that started a process opens in the editor on a
+click. The panel, the line under the prompt and the notice at a session's start
+are not drawn there: VS Code shows a mod's text and nothing else.
 
 A number names a row of the last list you printed, so `/strays` then
 `/strays kill 3` ends what you saw as row 3.

@@ -2,7 +2,25 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { age, describe, detailText, group, iconOf, line, listText, parse, parseArgs, parseInfo, resolve, widths } from '../hooks/procs'
+import {
+  HELP,
+  HELP_MARKDOWN,
+  age,
+  bar,
+  describe,
+  detailMarkdown,
+  detailText,
+  group,
+  iconOf,
+  line,
+  listMarkdown,
+  listText,
+  parse,
+  parseArgs,
+  parseInfo,
+  resolve,
+  widths,
+} from '../hooks/procs'
 
 // What Claude Code passes a ui.render hook for the panel, apart from the app.
 const PANE = {
@@ -65,7 +83,7 @@ const run = ($: Engine, args: string, command = 'strays') =>
 /** Stands for Claude Code and the machine: the scan answers `rows`, a kill takes its pids out of them. */
 function machine(on: On, surfaces: readonly string[] = ['terminal']) {
   const clock = mock.clock(on)
-  const state = { rows: SCAN, ended: [] as string[][], opened: [] as string[][], copied: [] as string[] }
+  const state = { rows: SCAN, ended: [] as string[][], opened: [] as string[][], copied: [] as string[], pasteboard: [] as string[] }
   on('process.run', ($, e) => {
     if (e.argv[1]?.endsWith('/bin/kill.sh')) {
       const targets = e.argv.slice(2)
@@ -76,6 +94,11 @@ function machine(on: On, surfaces: readonly string[] = ['terminal']) {
       return ran(pids.join(' ') + '\n')
     }
     if (e.argv[1]?.endsWith('/bin/info.sh')) return ran(INFO)
+    if (e.argv[0] === 'pbcopy') {
+      state.pasteboard.push(e.init?.stdin ?? '')
+
+      return ran('')
+    }
     if (e.argv[0] === 'open') {
       state.opened.push(e.argv.slice(1))
 
@@ -97,7 +120,11 @@ function machine(on: On, surfaces: readonly string[] = ['terminal']) {
   on('ui.log', () => ({ value: undefined }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.focus', () => ({}))
+  // The editor's panel takes no copy from a mod; the terminal and the desktop app do.
   on('ui.copy', ($, e) => {
+    if (!surfaces.some(surface => surface === 'terminal' || surface === 'desktop')) {
+      return { value: { isCopied: false, reason: 'no-surface' } }
+    }
     state.copied.push(e.text)
     return { value: { isCopied: true } }
   })
@@ -196,6 +223,7 @@ test('reads a command the short way and the long way', () => {
   expect(parseArgs('show :3000')).toEqual({ verb: 'info', target: ':3000' })
   for (const word of ['kill', 'k', 'end', 'stop']) expect(parseArgs(`${word} 2`)).toEqual({ verb: 'kill', target: '2' })
   expect(parseArgs('k all')).toEqual({ verb: 'kill', target: 'all' })
+  for (const word of ['copy', 'c', 'cp']) expect(parseArgs(`${word} 2`)).toEqual({ verb: 'copy', target: '2' })
   expect(parseArgs('?').verb).toBe('help')
   expect(parseArgs('nonsense').verb).toBe('help')
 
@@ -229,13 +257,82 @@ test('says everything about one process', () => {
     '  Transcript /Users/me/.claude/projects/-Users-me-shop/old-session.jsonl',
     "  Found by   Claude Code's mark in its environment (CLAUDECODE=1)",
     '',
-    '/strays kill 1 ends it',
+    '/strays kill 1 ends it · /strays copy 1 copies its command',
   ])
   // without the details, what the scan knew is still said
   expect(detailText(groups[3]!, null, 0)).toContain('  Found by   its process group, shared with a process Claude Code marked')
 })
 
-test('/strays prints the list, a number shows one in full, kill ends it: in any app', async ($, on) => {
+// The same answers where they are drawn as markdown: \u00a0 keeps a cell's words on one line.
+const LIST_MARKDOWN = [
+  '**1** left behind · **2** in the background · **1** still running · **325 MB** held',
+  '',
+  '| | # | Port | Command | Folder | Running | Memory | |',
+  '| :- | -: | :- | :- | :- | -: | -: | :- |',
+  '| 👻\u00a0**Left\u00a0behind** | 1 | [:3000](http://localhost:3000) [:24678](http://localhost:24678) | 🟩 `node vite` | shop | 2d\u00a02h | 300\u00a0MB | ████████ |',
+  '| 🌙\u00a0**In\u00a0the\u00a0background** | 2 | [:8766](http://localhost:8766) | 🐍 `Python -m http.server 8766` _this session_ | tmp | 10m | 23\u00a0MB | █░░░░░░░ |',
+  '|  | 3 |  | 👀 `tail -f build.log` _this session_ | tmp | 10m | 2\u00a0MB | █░░░░░░░ |',
+  '| 🏃\u00a0**Still\u00a0running** | 4 |  | 🧪 `npm test -- --watch` | work | 7m | 91\u00a0MB | ██░░░░░░ |',
+  '',
+  '`/strays 1` shows one in full · `/strays kill 1` ends it · `/strays kill all` ends the left-behind ones',
+].join('\n')
+
+test('says the same as markdown tables, for where padded columns do not line up', () => {
+  const groups = group(parse(tsv(SCAN)))
+  const list = listMarkdown(groups, 'session-1')
+  // the same rows under the same numbers as the text; the first line is prose,
+  // since the transcript puts the plugin's name before the answer
+  expect(list.order).toEqual(listText(groups, 'session-1').order)
+  expect(list.text).toBe(LIST_MARKDOWN)
+  expect(listMarkdown([], 'x').text).toMatch(/^✨ All clean/)
+
+  // heavy memory stands out, a fourth port is counted, and nothing in a command or a folder breaks the table
+  const heavy = { ...groups[0]!, label: 'sh -c cat `ls` | wc', cwd: '/x/my_*app', rssKb: 700 * 1024, ports: [1, 2, 3, 4, 5] }
+  expect(listMarkdown([heavy], '').text.split('\n')[4]).toBe(
+    '| 👻\u00a0**Left\u00a0behind** | 1 | [:1](http://localhost:1) [:2](http://localhost:2) [:3](http://localhost:3) +2 | 🟩 ``sh -c cat `ls` \\| wc`` | my\\_\\*app | 2d\u00a02h | **700\u00a0MB** | ████████ |',
+  )
+  // a bar is eight cells against the heaviest, one at least
+  expect([bar(0, 800), bar(100, 800), bar(400, 800), bar(800, 800), bar(900, 800)]).toEqual([
+    '█░░░░░░░',
+    '█░░░░░░░',
+    '████░░░░',
+    '████████',
+    '████████',
+  ])
+
+  expect(detailMarkdown(groups[0]!, parseInfo(INFO), 1).split('\n')).toEqual([
+    '👻 Left behind: the session that started it is closed',
+    '',
+    '| #1 | 🟩 `node vite` |',
+    '| :- | :- |',
+    '| Ports | [:3000](http://localhost:3000) [:24678](http://localhost:24678) |',
+    '| Folder | `/Users/me/shop` |',
+    '| Command | `/usr/local/bin/node /Users/me/shop/node_modules/.bin/vite` |',
+    '| Program | `/usr/local/bin/node` |',
+    '| Started | Fri  2 Oct 19:28:44 2026 (2d 2h ago) |',
+    '| Memory | 300 MB in 2 processes · CPU 0.5% |',
+    '| Processes | 501 `node vite` · 502 `esbuild --service` |',
+    '| Session | closed · old-sess |',
+    '| Project | `/Users/me/shop` |',
+    // a click opens the transcript in the editor
+    '| Transcript | [`/Users/me/.claude/projects/-Users-me-shop/old-session.jsonl`](/Users/me/.claude/projects/-Users-me-shop/old-session.jsonl) |',
+    "| Found by | Claude Code's mark in its environment (CLAUDECODE=1) |",
+    '',
+    '`/strays kill 1` ends it · `/strays copy 1` copies its command',
+  ])
+  // a path with a space or a bracket is still one link; one the editor would refuse stays code
+  const odd = (transcript: string) => detailMarkdown(groups[0]!, { fields: { transcript }, listen: [] }, 1)
+  expect(odd('/a b/(c)/d.jsonl')).toContain('| Transcript | [`/a b/(c)/d.jsonl`](/a%20b/%28c%29/d.jsonl) |')
+  expect(odd('/a:b/d.jsonl')).toContain('| Transcript | `/a:b/d.jsonl` |')
+  // one named by its pid has no number to show
+  expect(detailMarkdown(groups[3]!, null, 0)).toContain('|  | 👀 `tail -f build.log` |')
+
+  // the help says the same in both forms
+  expect(HELP).toContain('  /strays kill 2       end row 2 and what it started   (also: k, end, stop; a pid or :port works too)')
+  expect(HELP_MARKDOWN).toContain('| `/strays kill 2` | end row 2 and what it started (also: k, end, stop; a pid or :port works too) |')
+})
+
+test('in the editor panel every answer is markdown: the list, one in full, kill, help', async ($, on) => {
   const { clock, state, statuses, toasts } = machine(on, ['vscode'])
   await $.session.start({ surface: 'vscode', isInteractive: true, cwd: '/work' })
   await clock.settle()
@@ -244,30 +341,62 @@ test('/strays prints the list, a number shows one in full, kill ends it: in any 
   expect(statuses.at(-1)).toBe('3 stray processes on :3000 :24678 :8766 · /strays')
 
   const listed = await run($, '')
-  expect(listed.text).toContain('  1  :3000 :24678  🟩 node vite')
-  expect(listed.text).toContain('/strays 1 shows one in full')
+  expect(listed.text).toBe(LIST_MARKDOWN)
   // /ps is the same command
   expect((await run($, '', 'ps')).text).toBe(listed.text)
 
   const shownInFull = await run($, '1')
-  expect(shownInFull.text).toContain('#1  🟩 node vite\n  State      left behind')
-  expect(shownInFull.text).toContain('  Started    Fri  2 Oct 19:28:44 2026')
-  expect((await run($, 'i :8766')).text).toContain('#2  🐍 Python -m http.server 8766')
+  expect(shownInFull.text).toContain('👻 Left behind: the session that started it is closed\n\n| #1 | 🟩 `node vite` |')
+  expect(shownInFull.text).toContain('| Started | Fri  2 Oct 19:28:44 2026')
+  expect((await run($, 'i :8766')).text).toContain('| #2 | 🐍 `Python -m http.server 8766` |')
 
   // where no panel can draw, ui says so and prints the list
   expect((await run($, 'ui')).text).toMatch(/^The panel draws in the terminal and the desktop app/)
 
+  // copy by number: the whole command, through macOS since the panel takes no copy
+  expect((await run($, 'copy 1')).text).toBe('Copied the command of 🟩 `node vite` to the clipboard.')
+  expect(state.pasteboard).toEqual(['/usr/local/bin/node /Users/me/shop/node_modules/.bin/vite'])
+  expect(state.copied).toEqual([])
+  expect((await run($, 'c')).text).toMatch(/^Which one\? \/strays copy 2/)
+  expect((await run($, 'cp 42')).text).toMatch(/^Nothing matches 42\./)
+
   // kill by number: children first, each with its start time
   const killed = await run($, 'k 1')
   expect(state.ended).toEqual([['502@1010', '501@1000']])
-  expect(killed.text).toMatch(/^Ended 🟩 node vite \(:3000 :24678\): 2 processes\.\n\n🌙 In the background/)
+  expect(killed.text).toMatch(/^Ended 🟩 node vite \(:3000 :24678\): 2 processes\.\n\n\*\*2\*\* in the background · /)
+  expect(killed.text).toContain('| 🌙\u00a0**In\u00a0the\u00a0background** | 1 | [:8766](http://localhost:8766) |')
   // the list is numbered afresh, and a port names a row too
   await run($, 'kill :8766')
   expect(state.ended[1]).toEqual(['601@2000'])
   expect((await run($, 'kill all')).text).toMatch(/^Nothing is left behind\./)
   expect((await run($, 'kill')).text).toMatch(/^Which one\?/)
   expect((await run($, 'kill 42')).text).toMatch(/^Nothing matches 42\./)
-  expect((await run($, 'help')).text).toMatch(/^strays: processes Claude Code started/)
+  expect((await run($, 'help')).text).toBe(HELP_MARKDOWN)
+})
+
+// A terminal draws the session, or nothing does (claude -p): text in padded columns.
+for (const [where, surfaces] of [['the terminal', ['terminal']], ['claude -p', []]] as const) {
+  test(`in ${where} the answers stay text in padded columns`, async ($, on) => {
+    const { clock, state } = machine(on, surfaces)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+    await clock.settle()
+    const listed = await run($, '')
+    expect(listed.text).toContain('  1  :3000 :24678  🟩 node vite')
+    expect(listed.text).toContain('/strays 1 shows one in full')
+    expect((await run($, '1')).text).toContain('#1  🟩 node vite\n  State      left behind')
+    expect((await run($, 'help')).text).toBe(HELP)
+    // the terminal copies by itself; where nothing draws, macOS does
+    expect((await run($, 'copy 1')).text).toBe('Copied the command of 🟩 node vite to the clipboard.')
+    expect(surfaces.length > 0 ? state.copied : state.pasteboard).toEqual(['/usr/local/bin/node /Users/me/shop/node_modules/.bin/vite'])
+  })
+}
+
+test('the editor is known by its mark in the environment, whatever surfaces it names', async ($, on) => {
+  const { clock } = machine(on, [])
+  mock.env(on, { CLAUDE_CODE_ENTRYPOINT: 'claude-vscode' })
+  await $.session.start({ surface: 'vscode', isInteractive: true, cwd: '/work' })
+  await clock.settle()
+  expect((await run($, '')).text).toBe(LIST_MARKDOWN)
 })
 
 test('the panel: a row opens a process in full, End asks and then ends', async ($, on) => {

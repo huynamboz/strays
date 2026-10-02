@@ -8,13 +8,16 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import {
   HELP,
+  HELP_MARKDOWN,
   SECTIONS,
   age,
   basename,
+  detailMarkdown,
   detailText,
   facts,
   fit,
   group,
+  listMarkdown,
   listText,
   megabytes,
   parse,
@@ -142,6 +145,18 @@ async function loadInfo($: EngineInterface, g: Group) {
   }
 }
 
+/**
+ * Puts `text` on the clipboard: through the app that draws the session, else
+ * through macOS itself, since the editor's panel takes no copy from a mod.
+ */
+async function clip($: EngineInterface, text: string) {
+  const copied = await $.ui.copy({ text }).catch(() => ({ isCopied: false }))
+  if (copied.isCopied) return true
+  const ran = await $.process.run(['pbcopy'], { stdin: text, timeoutMs: 5000 }).catch(() => null)
+
+  return ran?.exitCode === 0
+}
+
 /** Shows one group in full in the panel, or the list again. */
 async function view($: EngineInterface, pid: number | null) {
   detail = pid
@@ -190,14 +205,35 @@ async function press($: EngineInterface, what: number | 'all', list: () => Group
   })
 }
 
-/** The numbered list, remembered so the transcript can draw it and a number can name a row. */
-function listing() {
+/**
+ * The numbered list, remembered so a number can name a row and, where it is
+ * text, so the transcript can draw it.
+ */
+function listing(isMarkdown: boolean) {
+  if (isMarkdown) {
+    const table = listMarkdown(groups, me)
+    order = table.order
+
+    return table.text
+  }
   const list = listText(groups, me)
   order = list.order
   printed.set(list.text, { groups: shown(groups, false), order: list.order })
   if (printed.size > 12) printed.delete(printed.keys().next().value ?? '')
 
   return list.text
+}
+
+/**
+ * Whether a command's answer is drawn as markdown here, in a font that is not
+ * monospace: the editor's panel, which draws none of a mod's own trees.
+ */
+async function drawsMarkdown($: EngineInterface) {
+  const entry = await $.env.get('CLAUDE_CODE_ENTRYPOINT').catch(() => undefined)
+  if (entry === 'claude-vscode') return true
+  const surfaces = await $.session.surfaces()
+
+  return surfaces.length > 0 && surfaces.every(surface => surface === 'vscode' || surface === 'mobile')
 }
 
 export const register: Register = on => {
@@ -210,7 +246,7 @@ export const register: Register = on => {
             name === 'strays'
               ? 'Processes Claude Code started and left running: list them, see one in full, end it'
               : 'Short for /strays: processes Claude Code left running',
-          argumentHint: '[number | :port | kill <number|all> | ui | help]',
+          argumentHint: '[number | :port | kill <number|all> | copy <number> | ui | help]',
           immediate: true,
         })
       } catch (err) {
@@ -237,7 +273,8 @@ export const register: Register = on => {
 
   on('command.run', { command: ['strays', 'ps'] }, async ($, e) => {
     const ask = parseArgs(e.args)
-    if (ask.verb === 'help') return { text: HELP }
+    const isMarkdown = await drawsMarkdown($)
+    if (ask.verb === 'help') return { text: isMarkdown ? HELP_MARKDOWN : HELP }
     await scan($)
     // A number names a row of the last list; before any list was printed here, of the list as it stands.
     if (order.length === 0) order = listText(groups, me).order
@@ -245,7 +282,7 @@ export const register: Register = on => {
     if (ask.verb === 'ui') {
       const surfaces = await $.session.surfaces()
       if (!surfaces.some(surface => surface === 'terminal' || surface === 'desktop')) {
-        return { text: `The panel draws in the terminal and the desktop app. Here it is as a list:\n\n${listing()}` }
+        return { text: `The panel draws in the terminal and the desktop app. Here it is as a list:\n\n${listing(isMarkdown)}` }
       }
       isPaneOpen = true
       note = ''
@@ -260,19 +297,37 @@ export const register: Register = on => {
 
     if (ask.verb === 'info') {
       const g = resolve(ask.target, groups, order)
-      if (!g) return { text: `Nothing matches ${ask.target || 'that'}.\n\n${listing()}` }
+      if (!g) return { text: `Nothing matches ${ask.target || 'that'}.\n\n${listing(isMarkdown)}` }
 
-      return { text: detailText(g, await loadInfo($, g), order.indexOf(g.pid) + 1) }
+      const data = await loadInfo($, g)
+      const index = order.indexOf(g.pid) + 1
+
+      return { text: isMarkdown ? detailMarkdown(g, data, index) : detailText(g, data, index) }
+    }
+
+    if (ask.verb === 'copy') {
+      if (ask.target === '') return { text: `Which one? /strays copy 2 copies row 2's command.\n\n${listing(isMarkdown)}` }
+      const g = resolve(ask.target, groups, order)
+      if (!g) return { text: `Nothing matches ${ask.target}.\n\n${listing(isMarkdown)}` }
+      // as the machine has it, whole: the scan's own copy may be cut
+      const command = (await loadInfo($, g))?.fields.command || g.command
+      const name = isMarkdown ? `${g.icon} \`${g.label.replace(/`/g, "'")}\`` : `${g.icon} ${g.label}`
+
+      return {
+        text: (await clip($, command))
+          ? `Copied the command of ${name} to the clipboard.`
+          : `The clipboard did not take it. The command of ${name}:\n\n${isMarkdown ? `\`\`\`\n${command}\n\`\`\`` : command}`,
+      }
     }
 
     if (ask.verb === 'kill') {
       if (ask.target === '') {
-        return { text: `Which one? /strays kill 2 ends row 2, /strays kill all ends every left-behind one.\n\n${listing()}` }
+        return { text: `Which one? /strays kill 2 ends row 2, /strays kill all ends every left-behind one.\n\n${listing(isMarkdown)}` }
       }
       const list =
         ask.target === 'all' ? orphans() : [resolve(ask.target, groups, order)].filter((g): g is Group => g !== undefined)
       if (list.length === 0) {
-        return { text: `${ask.target === 'all' ? 'Nothing is left behind.' : `Nothing matches ${ask.target}.`}\n\n${listing()}` }
+        return { text: `${ask.target === 'all' ? 'Nothing is left behind.' : `Nothing matches ${ask.target}.`}\n\n${listing(isMarkdown)}` }
       }
       const names = list.map(g => `${g.icon} ${g.label}${portsText(g) ? ` (${portsText(g)})` : ''}`)
       const ended = await stop($, list)
@@ -280,12 +335,12 @@ export const register: Register = on => {
       return {
         text:
           ended > 0
-            ? `Ended ${names.join(', ')}: ${plural(ended, 'process')}.\n\n${listing()}`
-            : `Nothing was ended: ${names.join(', ')} had already gone or changed.\n\n${listing()}`,
+            ? `Ended ${names.join(', ')}: ${plural(ended, 'process')}.\n\n${listing(isMarkdown)}`
+            : `Nothing was ended: ${names.join(', ')} had already gone or changed.\n\n${listing(isMarkdown)}`,
       }
     }
 
-    return { text: listing() }
+    return { text: listing(isMarkdown) }
   })
 
   on('ui.close', { id: PANE }, async ($, e, next) => {

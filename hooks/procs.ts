@@ -249,12 +249,14 @@ export function line(g: Group, w: ReturnType<typeof widths>) {
   ].join('  ')
 }
 
+const CLEAN = '✨ All clean: nothing Claude Code started is still running.'
+
 /** The list as text, each row numbered: the number is what `/strays 2` and `/strays kill 2` name. */
 export function listText(groups: Group[], me: string) {
   const rows = shown(groups, false)
   const w = widths(rows, 100)
   const order = rows.map(g => g.pid)
-  if (rows.length === 0) return { text: '✨ All clean: nothing Claude Code started is still running.', order }
+  if (rows.length === 0) return { text: CLEAN, order }
   const digits = String(rows.length).length
   const blocks = SECTIONS.filter(s => s.kind !== 'mcp')
     .map(section => ({ ...section, rows: visible(groups, section.kind) }))
@@ -272,6 +274,90 @@ export function listText(groups: Group[], me: string) {
   const hint = `/strays 1 shows one in full · /strays kill 1 ends it${hasOrphans ? ' · /strays kill all ends the left-behind ones' : ''} · /strays ui opens the panel`
 
   return { text: [...blocks, hint].join('\n\n'), order }
+}
+
+// Markdown, for where a command's answer is drawn as a reply is, in a font that
+// is not monospace (the editor's panel): columns padded with spaces do not line
+// up there, a table does.
+const cut = (text: string, width: number) => (text.length > width ? text.slice(0, width - 1) + '…' : text)
+// Words that stay on one line when a narrow table folds its cells.
+const together = (text: string) => text.replace(/ /g, ' ')
+// A table cell: a pipe would end it, and markdown's marks would be read as marks.
+const plain = (text: string) => text.replace(/[\\`*_[\]<>|~]/g, '\\$&')
+const code = (text: string) => {
+  const ticks = '`'.repeat(Math.max(0, ...(text.match(/`+/g) ?? []).map(run => run.length)) + 1)
+  const pad = text.startsWith('`') || text.endsWith('`') ? ' ' : ''
+
+  return `${ticks}${pad}${text.replace(/\|/g, '\\|')}${pad}${ticks}`
+}
+
+// A port as a link: a click opens what listens there in the browser.
+const portLink = (port: number) => `[:${port}](http://localhost:${port})`
+// A file as a link the editor opens on a click; a path it would not take stays code.
+const fileLink = (path: string) =>
+  /[:\\]/.test(path) || !path.startsWith('/')
+    ? code(path)
+    : `[${code(path)}](${path.split('/').map(encodeURIComponent).join('/').replace(/\(/g, '%28').replace(/\)/g, '%29')})`
+/** Memory as a bar of eight cells against `biggest`, as the panel draws it, in characters. */
+export const bar = (rssKb: number, biggest: number) => {
+  const filled = Math.min(8, Math.max(1, Math.round((rssKb / biggest) * 8)))
+
+  return '█'.repeat(filled) + '░'.repeat(8 - filled)
+}
+
+/**
+ * The list as markdown: the same rows and numbers as `listText`, in one table,
+ * each group named on its first row, each port a link, memory as a bar too.
+ * The first line is prose, since the transcript puts the plugin's name before
+ * the answer.
+ */
+export function listMarkdown(groups: Group[], me: string) {
+  const rows = shown(groups, false)
+  const order = rows.map(g => g.pid)
+  if (rows.length === 0) return { text: CLEAN, order }
+  const sections = SECTIONS.filter(s => s.kind !== 'mcp')
+    .map(section => ({ ...section, rows: visible(groups, section.kind) }))
+    .filter(section => section.rows.length > 0)
+  const held = rows.filter(g => g.kind === 'orphan' || g.kind === 'detached').reduce((sum, g) => sum + g.rssKb, 0)
+  const counts = sections.map(section => `**${section.rows.length}** ${section.title.toLowerCase()}`)
+  if (held > 0) counts.push(`**${megabytes(held)}** held`)
+  // against the heaviest here, 256 MB at least: the panel's measure
+  const biggest = Math.max(256 * 1024, ...rows.map(g => g.rssKb))
+  const lines = sections.flatMap(section =>
+    section.rows.map((g, i) => {
+      const ports = g.ports.slice(0, 3).map(portLink)
+      if (g.ports.length > 3) ports.push(`+${g.ports.length - 3}`)
+      const size = together(megabytes(g.rssKb))
+      const cells = [
+        i === 0 ? together(`${section.icon} **${section.title}**`) : '',
+        String(order.indexOf(g.pid) + 1),
+        ports.join(' '),
+        `${g.icon} ${code(cut(g.label, 56))}${g.sid === me && g.kind !== 'orphan' ? ' _this session_' : ''}`,
+        plain(basename(g.cwd) || '/'),
+        together(age(g.seconds)),
+        // what the panel's memory bar draws in yellow or red
+        g.rssKb > 300 * 1024 ? `**${size}**` : size,
+        bar(g.rssKb, biggest),
+      ]
+
+      return `| ${cells.join(' | ')} |`
+    }),
+  )
+  const hasOrphans = rows.some(g => g.kind === 'orphan')
+  const hint = `\`/strays 1\` shows one in full · \`/strays kill 1\` ends it${hasOrphans ? ' · `/strays kill all` ends the left-behind ones' : ''}`
+
+  return {
+    text: [
+      counts.join(' · '),
+      '',
+      '| | # | Port | Command | Folder | Running | Memory | |',
+      '| :- | -: | :- | :- | :- | -: | -: | :- |',
+      ...lines,
+      '',
+      hint,
+    ].join('\n'),
+    order,
+  }
 }
 
 /** What bin/info.sh printed: one value a key, and every listening address. */
@@ -326,17 +412,58 @@ export function detailText(g: Group, info: Info | null, index: number) {
   })
   const name = index > 0 ? `#${index}  ` : ''
 
-  return [`${name}${g.icon} ${g.label}`, ...body, '', `/strays kill ${index > 0 ? index : g.pid} ends it`].join('\n')
+  const n = index > 0 ? index : g.pid
+
+  return [`${name}${g.icon} ${g.label}`, ...body, '', `/strays kill ${n} ends it · /strays copy ${n} copies its command`].join('\n')
+}
+
+// The values that are paths or commands: drawn as code, so nothing in them is read as markdown.
+const LITERAL = ['Folder', 'Command', 'Program', 'Project']
+
+/**
+ * One group in full, as markdown: its state said first, then a table headed by
+ * its number and name. Each port is a link, and so is the transcript of the
+ * session that started it.
+ */
+export function detailMarkdown(g: Group, info: Info | null, index: number) {
+  const state = STATE[g.kind]
+  const icon = SECTIONS.find(section => section.kind === g.kind)?.icon ?? ''
+  const cell = (label: string, value: string) => {
+    if (LITERAL.includes(label)) return code(value)
+    if (label === 'Transcript') return fileLink(value)
+    if (label === 'Ports') return g.ports.map(portLink).join(' ')
+    if (label !== 'Processes') return plain(value)
+
+    return value
+      .split('\n')
+      .map(row => `${row.slice(0, row.indexOf(' '))} ${code(row.slice(row.indexOf(' ') + 1))}`)
+      .join(' · ')
+  }
+  const rows = facts(g, info)
+    .filter(([label]) => label !== 'State')
+    .map(([label, value]) => `| ${label} | ${cell(label, value)} |`)
+  const n = index > 0 ? index : g.pid
+
+  return [
+    `${icon} ${state.slice(0, 1).toUpperCase()}${state.slice(1)}`,
+    '',
+    `| ${index > 0 ? `#${index}` : ''} | ${g.icon} ${code(g.label)} |`,
+    '| :- | :- |',
+    ...rows,
+    '',
+    `\`/strays kill ${n}\` ends it · \`/strays copy ${n}\` copies its command`,
+  ].join('\n')
 }
 
 /** What a word after /strays asks for. */
-export type Ask = { verb: 'list' | 'ui' | 'info' | 'kill' | 'help'; target: string }
+export type Ask = { verb: 'list' | 'ui' | 'info' | 'kill' | 'copy' | 'help'; target: string }
 
 const VERBS: Record<string, Ask['verb']> = {
   list: 'list', ls: 'list', l: 'list',
   ui: 'ui', u: 'ui', panel: 'ui', pane: 'ui', p: 'ui', open: 'ui', o: 'ui',
   info: 'info', i: 'info', show: 'info', s: 'info', detail: 'info', details: 'info', d: 'info',
   kill: 'kill', k: 'kill', end: 'kill', e: 'kill', stop: 'kill', x: 'kill',
+  copy: 'copy', c: 'copy', cp: 'copy',
   help: 'help', h: 'help', '?': 'help',
 }
 
@@ -363,15 +490,31 @@ export function resolve(target: string, groups: Group[], order: number[]): Group
   return byNumber ?? groups.find(g => g.pid === n || g.members.some(m => m.pid === n))
 }
 
+// What to type, what it does, and the other words for it.
+const USAGE: [string, string, string][] = [
+  ['/strays', 'the list, each row numbered', ''],
+  ['/strays 2', 'row 2 in full: folder, command, start time, memory, session', 'i, info, show'],
+  ['/strays :3000', 'the same, for whatever listens on port 3000', ''],
+  ['/strays kill 2', 'end row 2 and what it started', 'k, end, stop; a pid or :port works too'],
+  ['/strays kill all', 'end every left-behind one', ''],
+  ['/strays copy 2', "copy row 2's command to the clipboard", 'c, cp'],
+  ['/strays ui', 'the panel: click a row for details, click End to end it', 'u, open'],
+]
+
 export const HELP = [
   'strays: processes Claude Code started and left running, in any session',
   '',
-  '  /strays              the list, each row numbered',
-  '  /strays 2            row 2 in full: folder, command, start time, memory, session   (also: i, info, show)',
-  '  /strays :3000        the same, for whatever listens on port 3000',
-  '  /strays kill 2       end row 2 and what it started   (also: k, end, stop; a pid or :port works too)',
-  '  /strays kill all     end every left-behind one',
-  '  /strays ui           the panel: click a row for details, click End to end it   (also: u, open)',
+  ...USAGE.map(([type, does, also]) => `  ${type.padEnd(21)}${does}${also ? `   (also: ${also})` : ''}`),
   '',
   '  /ps is the same command, shorter.',
+].join('\n')
+
+export const HELP_MARKDOWN = [
+  'Processes Claude Code started and left running, in any session.',
+  '',
+  '| Type | To get |',
+  '| :- | :- |',
+  ...USAGE.map(([type, does, also]) => `| ${code(type)} | ${plain(does)}${also ? ` (also: ${plain(also)})` : ''} |`),
+  '',
+  '`/ps` is the same command, shorter.',
 ].join('\n')
