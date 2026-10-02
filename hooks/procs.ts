@@ -455,8 +455,8 @@ export function detailMarkdown(g: Group, info: Info | null, index: number) {
   ].join('\n')
 }
 
-/** What a word after /strays asks for. */
-export type Ask = { verb: 'list' | 'ui' | 'info' | 'kill' | 'copy' | 'help'; target: string }
+/** What a word after /strays asks for; `auto` is the bare command, which each app answers its own way. */
+export type Ask = { verb: 'auto' | 'list' | 'ui' | 'info' | 'kill' | 'copy' | 'help'; target: string }
 
 const VERBS: Record<string, Ask['verb']> = {
   list: 'list', ls: 'list', l: 'list',
@@ -469,7 +469,7 @@ const VERBS: Record<string, Ask['verb']> = {
 
 export function parseArgs(args: string): Ask {
   const [first = '', ...rest] = args.trim().split(/\s+/)
-  if (first === '') return { verb: 'list', target: '' }
+  if (first === '') return { verb: 'auto', target: '' }
   const verb = VERBS[first.toLowerCase()]
   if (verb) return { verb, target: rest.join(' ') }
   // A bare number, pid or :port asks for that one in full.
@@ -492,7 +492,8 @@ export function resolve(target: string, groups: Group[], order: number[]): Group
 
 // What to type, what it does, and the other words for it.
 const USAGE: [string, string, string][] = [
-  ['/strays', 'the list, each row numbered', ''],
+  ['/strays', 'the panel in the terminal and the desktop app, the list everywhere else', ''],
+  ['/strays ls', 'the list, each row numbered', 'l, list'],
   ['/strays 2', 'row 2 in full: folder, command, start time, memory, session', 'i, info, show'],
   ['/strays :3000', 'the same, for whatever listens on port 3000', ''],
   ['/strays kill 2', 'end row 2 and what it started', 'k, end, stop; a pid or :port works too'],

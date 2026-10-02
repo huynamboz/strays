@@ -214,7 +214,8 @@ test('draws the rows as one table and numbers them', () => {
 })
 
 test('reads a command the short way and the long way', () => {
-  expect(parseArgs('')).toEqual({ verb: 'list', target: '' })
+  // the bare command is each app's own: the panel where one can draw, the list elsewhere
+  expect(parseArgs('')).toEqual({ verb: 'auto', target: '' })
   for (const word of ['ls', 'l', 'list']) expect(parseArgs(word).verb).toBe('list')
   for (const word of ['ui', 'u', 'open', 'panel']) expect(parseArgs(word).verb).toBe('ui')
   expect(parseArgs('2')).toEqual({ verb: 'info', target: '2' })
@@ -380,7 +381,11 @@ for (const [where, surfaces] of [['the terminal', ['terminal']], ['claude -p', [
     const { clock, state } = machine(on, surfaces)
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
     await clock.settle()
-    const listed = await run($, '')
+    // the bare command opens the panel where one can draw, and prints the list where none can
+    const bare = await run($, '')
+    if (surfaces.length > 0) expect(bare.text).toBeUndefined()
+    else expect(bare.text).toContain('  1  :3000 :24678  🟩 node vite')
+    const listed = await run($, 'ls')
     expect(listed.text).toContain('  1  :3000 :24678  🟩 node vite')
     expect(listed.text).toContain('/strays 1 shows one in full')
     expect((await run($, '1')).text).toContain('#1  🟩 node vite\n  State      left behind')
@@ -403,7 +408,8 @@ test('the panel: a row opens a process in full, End asks and then ends', async (
   const { clock, state } = machine(on)
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
   await clock.settle()
-  // in the terminal, ui opens the panel and prints nothing
+  // in the terminal, the bare command opens the panel and prints nothing, as ui does
+  expect((await run($, '')).text).toBeUndefined()
   expect((await run($, 'ui')).text).toBeUndefined()
 
   for (const surface of ['terminal', 'desktop'] as const) {
@@ -485,7 +491,7 @@ test('says all is clean when nothing runs, and draws docked and in the transcrip
   // what Claude Code would draw for a command's output when the mod leaves it alone
   on('ui.render', () => ({ type: 'Text', props: {}, children: ['plain'] }))
   state.rows = []
-  expect((await run($, '')).text).toMatch(/^✨ All clean/)
+  expect((await run($, 'ls')).text).toMatch(/^✨ All clean/)
   await run($, 'ui')
   const clean = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await clean.find({ type: 'Text', text: /^✨ All clean/ })).toBeDefined()
@@ -505,7 +511,7 @@ test('says all is clean when nothing runs, and draws docked and in the transcrip
   }
 
   // the list a command printed is drawn in the transcript in color, row by row
-  const listed = await run($, '')
+  const listed = await run($, 'ls')
   const output = { plugin: 'strays', component: 'CommandOutput', requestId: 'message-1', viewport: { columns: 120, rows: 40 } } as const
   const drawn = await $.ui.mount({ ...output, surface: 'terminal', props: { command: 'strays', args: '', isErrored: false, text: listed.text ?? '' } })
   expect(await drawn.find({ type: 'Text', text: '👻 Left behind' })).toBeDefined()

@@ -279,9 +279,13 @@ export const register: Register = on => {
     // A number names a row of the last list; before any list was printed here, of the list as it stands.
     if (order.length === 0) order = listText(groups, me).order
 
-    if (ask.verb === 'ui') {
+    if (ask.verb === 'ui' || ask.verb === 'auto') {
+      // The panel draws in the terminal and the desktop app. Anywhere else (the
+      // editor's panel, claude -p) the bare command prints the list instead.
       const surfaces = await $.session.surfaces()
-      if (!surfaces.some(surface => surface === 'terminal' || surface === 'desktop')) {
+      if (isMarkdown || !surfaces.some(surface => surface === 'terminal' || surface === 'desktop')) {
+        if (ask.verb === 'auto') return { text: listing(isMarkdown) }
+
         return { text: `The panel draws in the terminal and the desktop app. Here it is as a list:\n\n${listing(isMarkdown)}` }
       }
       isPaneOpen = true

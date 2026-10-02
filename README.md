@@ -29,7 +29,8 @@ claude --plugin-dir /path/to/strays
 
 | Command | Does |
 | :- | :- |
-| `/strays` | the list, each row numbered. Works everywhere: terminal, desktop, VS Code, `claude -p` |
+| `/strays` | in the terminal and the desktop app, opens the panel; in VS Code and `claude -p`, prints the list |
+| `/strays ls` | the list, each row numbered, wherever you are (also `l`, `list`) |
 | `/strays 2` | row 2 in full: folder, command, program, start time, memory, its processes, the session that started it (also `i 2`, `info 2`, `show 2`) |
 | `/strays :3000` | the same, for whatever listens on port 3000 |
 | `/strays kill 2` | ends row 2 and everything it started (also `k`, `end`, `stop`; a pid or `:port` names one too) |
