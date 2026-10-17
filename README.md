@@ -72,7 +72,7 @@ says so once.
 
 ## How it finds them
 
-`bin/scan.sh` reads the process table and keeps a process when one of four
+`bin/scan.sh` reads the process table and keeps a process when one of five
 things ties it to Claude Code:
 
 1. **Claude Code's mark.** Claude Code puts `CLAUDECODE=1`, its session's id and
@@ -80,10 +80,17 @@ things ties it to Claude Code:
    keeps its environment for life: after the session is gone, after `nohup`.
 2. **The Bash tool's shell.** Every command the Bash tool runs is wrapped in a
    shell whose command line names `~/.claude/shell-snapshots`.
-3. **The process tree.** Whatever hangs under a running session, or under such a
+3. **Claude Code's own search.** Claude Code carries its own `rg`, `bfs` and
+   `ugrep` and runs itself under their names. In a folder that is not a git
+   repository, a session lists the files with that `rg` directly, not through
+   the Bash tool, so the `rg` carries no mark; in a folder as large as your home
+   it does not finish. A process named for one of the three whose program is
+   another is Claude Code's. It shows under its session once it has run for a
+   minute, and as left behind when the session is gone.
+4. **The process tree.** Whatever hangs under a running session, or under such a
    shell. macOS shows no environment for its own programs (`sh`, `tail`, `nc`,
    `ssh`), so their place in the tree stands in.
-4. **The process group.** One Bash call starts one process group, and a
+5. **The process group.** One Bash call starts one process group, and a
    `nohup tail -f log &` stays in it after the shell that started it exits: a
    process that shares a group with a marked one, and whose group leader is gone
    or marked too, came from the same call.

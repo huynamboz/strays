@@ -19,6 +19,7 @@ import {
   parseArgs,
   parseInfo,
   resolve,
+  shown,
   widths,
 } from '../hooks/procs'
 
@@ -172,6 +173,23 @@ test('groups a process with what it started and says why each is here', () => {
   const crash = ['900', '1', '5', '8000', 'old', '400', '0', '0', '', '/x', 'e', '900', '0', '1', '/c/chrome_crashpad_handler --monitor-self']
   expect(group(parse(tsv([crash])))).toEqual([])
   expect([age(42), age(600), age(7260), age(180000)]).toEqual(['42s', '10m', '2h 1m', '2d 2h'])
+})
+
+test('a search a session runs for itself shows once it is stuck, and is found when its session is gone', () => {
+  // Claude Code lists a folder's files with its own rg, not through the Bash tool:
+  // the session is its parent, and it carries no mark
+  const stuck = ['811', '900', '300', '40000', '', '900', '1', '1', '', '/Users/me', 's', '900', '180', '6000', 'rg --no-config --files --hidden /Users/me']
+  const quick = ['812', '900', '2', '40000', '', '900', '1', '1', '', '/work', 's', '900', '90', '6300', 'rg --no-config --files --hidden /work']
+  const left = ['813', '1', '7200', '40000', '', '', '0', '0', '', '/Users/me', 's', '813', '99', '100', 'rg --no-config --files --hidden /Users/me']
+  const groups = group(parse(tsv([stuck, quick, left])))
+  expect(groups.map(g => [g.pid, g.kind, g.how, g.icon])).toEqual([
+    [813, 'orphan', 's', '🔎'],
+    [811, 'running', 's', '🔎'],
+    [812, 'running', 's', '🔎'],
+  ])
+  // it is the session's work, not a server it keeps: a row, once it has run for a minute
+  expect(shown(groups, false).map(g => g.pid)).toEqual([813, 811])
+  expect(groups[1]?.label).toBe('rg --no-config --files --hidden me')
 })
 
 test('gives each kind of process its icon', () => {

@@ -2,7 +2,7 @@
 // function is plain data in, plain data out, so the tests call them directly.
 
 /** How a process was tied to Claude Code: bin/scan.sh says what each letter stands for. */
-export type How = 'e' | 'w' | 't' | 'g'
+export type How = 'e' | 'w' | 's' | 't' | 'g'
 
 /** One process, as bin/scan.sh prints it. */
 export type Proc = {
@@ -68,6 +68,7 @@ const STATE: Record<Kind, string> = {
 const FOUND: Record<How, string> = {
   e: "Claude Code's mark in its environment (CLAUDECODE=1)",
   w: 'it is the shell the Bash tool ran a command in',
+  s: 'it is Claude Code itself, run as its own search tool (rg, bfs, ugrep)',
   t: 'its place in the process tree, under a Claude Code session',
   g: 'its process group, shared with a process Claude Code marked',
 }
@@ -88,7 +89,7 @@ export function parse(stdout: string): Proc[] {
       isAttached: f[7] === '1',
       ports: (f[8] ?? '').split(',').filter(Boolean).map(Number),
       cwd: f[9] ?? '',
-      how: (['e', 'w', 't', 'g'].includes(f[10] ?? '') ? f[10] : 'e') as How,
+      how: (['e', 'w', 's', 't', 'g'].includes(f[10] ?? '') ? f[10] : 'e') as How,
       pgid: Number(f[11]),
       cpu: Number((f[12] ?? '0').replace(',', '.')) || 0,
       start: Number(f[13]),
@@ -142,6 +143,7 @@ const ICONS: [RegExp, string][] = [
   [/\b(postgres|psql|mysqld?|redis(-server)?|mongod?|sqlite3?)\b/i, '💾'],
   [/\bdocker\b|\bpodman\b/i, '🐳'],
   [/\b(tail|less|watch|fswatch|chokidar|nodemon)\b|--watch\b/i, '👀'],
+  [/^(rg|bfs|ugrep|grep|find|fd|ag)(\s|$)/, '🔎'],
   [/^(npm|pnpm|yarn|bun|npx|bunx)\b/i, '📦'],
   [/^(node|deno|tsx|ts-node)(\s|$)|\b(vite|next|webpack|esbuild|astro|nuxt)\b/i, '🟩'],
   [/^python[\d.]*(\s|$)|\b(uvicorn|gunicorn|flask|django|manage\.py)\b/i, '🐍'],
