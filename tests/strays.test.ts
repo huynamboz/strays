@@ -484,6 +484,39 @@ test('the panel: a row opens a process in full, End asks and then ends', async (
   expect(await ui.find({ key: 'row-602' })).toBeDefined()
 })
 
+test('the notice at the start waits for the screen, which drops a toast sent before it is up', async ($, on) => {
+  const surfaces: string[] = []
+  const { clock, statuses, toasts } = machine(on, surfaces)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await clock.settle()
+  // the first scan is in, and nothing draws the session yet
+  expect(toasts).toEqual([])
+  expect(statuses).toEqual(['3 stray processes on :3000 :24678 :8766 · /strays'])
+  surfaces.push('terminal')
+  await clock.advance(250)
+  expect(toasts).toEqual(['👻 1 process from earlier Claude Code sessions still running (300 MB): /strays'])
+  // the status goes out again, now that it shows
+  expect(statuses).toEqual(['3 stray processes on :3000 :24678 :8766 · /strays', '3 stray processes on :3000 :24678 :8766 · /strays'])
+})
+
+test('a process in full: above the prompt its buttons come before its facts, docked after them', async ($, on) => {
+  const { clock } = machine(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await clock.settle()
+  await run($, 'ui')
+  for (const placement of ['inline', 'dock'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, placement } })
+    await ui.press({ key: 'row-501' })
+    const drawn = (await ui.findAll({})).map(found => found.key ?? found.text)
+    for (const key of ['end', 'folder', 'browser', 'copy']) {
+      if (placement === 'inline') expect(drawn.indexOf(key)).toBeLessThan(drawn.indexOf('State'))
+      else expect(drawn.indexOf(key)).toBeGreaterThan(drawn.indexOf('Found by'))
+    }
+    await ui.press({ key: 'back' })
+    await ui.unmount()
+  }
+})
+
 test('an asked question takes itself back, and End all asks first', async ($, on) => {
   const { clock, state } = machine(on)
   await run($, 'ui')

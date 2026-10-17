@@ -255,6 +255,19 @@ async function drawsMarkdown($: EngineInterface) {
   return surfaces.length > 0 && surfaces.every(surface => surface === 'vscode' || surface === 'mobile')
 }
 
+/**
+ * Calls `fn` once the session draws somewhere: in the terminal, once its screen
+ * is up and has bound the session. A toast or a status sent before then is
+ * dropped, and the session's first scan may end sooner. A look every quarter
+ * second; past `tries` of them `fn` runs anyway, as it did before it waited.
+ */
+function whenDrawn($: EngineInterface, fn: () => void, tries = 120) {
+  void $.session.surfaces().then(surfaces => {
+    if (surfaces.length > 0 || tries <= 1) fn()
+    else $.clock.after(250, () => whenDrawn($, fn, tries - 1))
+  })
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     for (const name of COMMANDS) {
@@ -276,11 +289,15 @@ export const register: Register = on => {
     // Off the session's start: look once now, then every half minute, or every five seconds while the panel is open.
     $.clock.after(0, async () => {
       await scan($)
-      const left = orphans()
-      if (left.length > 0) {
-        const size = megabytes(left.reduce((sum, g) => sum + g.rssKb, 0))
-        $.ui.toast(`👻 ${plural(left.length, 'process')} from earlier Claude Code sessions still running (${size}): /strays`)
-      }
+      whenDrawn($, () => {
+        // The scan's status may have gone out before the screen was up: again, now that it is.
+        if (statusText !== undefined) $.ui.status(statusText)
+        const left = orphans()
+        if (left.length > 0) {
+          const size = megabytes(left.reduce((sum, g) => sum + g.rssKb, 0))
+          $.ui.toast(`👻 ${plural(left.length, 'process')} from earlier Claude Code sessions still running (${size}): /strays`)
+        }
+      })
     })
     $.clock.every(5000, () => {
       ticks += 1
@@ -474,88 +491,119 @@ export const register: Register = on => {
       const cardWidth = Math.min(columns, 100)
       const valueWidth = Math.max(20, cardWidth - labelWidth - 4)
 
+      const back = <Button key="back" label="← Back" hotkey="b" dimColor onPress={() => view($, null)} />
+      const heading = (
+        <Box flexDirection="row" columnGap={1}>
+          {portsText(chosen) !== '' && (
+            <Text backgroundColor={color} color="black" bold>
+              {` ${portsText(chosen)} `}
+            </Text>
+          )}
+          <Text bold wrap="truncate-end">{`${chosen.icon} ${chosen.label}`}</Text>
+        </Box>
+      )
+      const card = (
+        <Box flexDirection="column" borderStyle="round" borderColor={color} paddingX={1} width={cardWidth}>
+          {facts(chosen, data).map(([label, value]) => (
+            <Box flexDirection="row">
+              <Box flexShrink={0} width={labelWidth}>
+                <Text dimColor>{label}</Text>
+              </Box>
+              <Box flexDirection="column" width={valueWidth}>
+                {label === 'Memory' ? (
+                  <Box flexDirection="row" columnGap={1}>
+                    {meter(chosen, Math.max(256 * 1024, chosen.rssKb))}
+                    <Text dimColor wrap="truncate-end">
+                      {value.slice(megabytes(chosen.rssKb).length)}
+                    </Text>
+                  </Box>
+                ) : (
+                  value.split('\n').map(text => (
+                    <Text wrap="wrap" color={label === 'State' ? color : undefined}>
+                      {text}
+                    </Text>
+                  ))
+                )}
+              </Box>
+            </Box>
+          ))}
+        </Box>
+      )
+      const done = note !== '' && <Text color="green">{`✓ ${note}`}</Text>
+      const buttons = (
+        <Box flexDirection="row" columnGap={2} flexWrap="wrap">
+          {isEnding ? (
+            <Text color="red">{`${spinner} ending…`}</Text>
+          ) : (
+            <Button
+              key="end"
+              label={isAsked ? 'Yes, end it' : 'End process'}
+              hotkey="e"
+              variant="primary"
+              onPress={() => press($, chosen.pid, () => groups.filter(g => g.pid === chosen.pid))}
+            />
+          )}
+          <Button
+            key="folder"
+            label="Open folder"
+            hotkey="f"
+            onPress={async () => {
+              await $.process.run(['open', data?.fields.cwd || chosen.cwd])
+            }}
+          />
+          {port !== undefined && (
+            <Button
+              key="browser"
+              label={`Open :${port}`}
+              hotkey="o"
+              onPress={async () => {
+                await $.process.run(['open', `http://localhost:${port}`])
+              }}
+            />
+          )}
+          <Button
+            key="copy"
+            label="Copy command"
+            hotkey="c"
+            onPress={async pressed => {
+              await $.ui.copy({ text: data?.fields.command || chosen.command, surface: pressed.surface })
+              note = 'command copied'
+              redraw($)
+            }}
+          />
+        </Box>
+      )
+      const hint = <Text dimColor>click a button · b back · e end · f folder · c copy · Esc to the prompt</Text>
+
+      // Above the prompt a panel shows about ten rows: the buttons go under the
+      // name, over the facts, where they are never cut off.
+      if (!isDocked) {
+        return (
+          <Box flexDirection="column">
+            <Box flexDirection="row" columnGap={1}>
+              {back}
+              <Text color={color}>{spinner}</Text>
+              {heading}
+            </Box>
+            {buttons}
+            {done}
+            {card}
+            {hint}
+          </Box>
+        )
+      }
+
       return (
         <Box flexDirection="column" rowGap={1}>
           <Box flexDirection="row" columnGap={1}>
-            <Button key="back" label="← Back" hotkey="b" dimColor onPress={() => view($, null)} />
+            {back}
             <Text color={color}>{spinner}</Text>
           </Box>
-          <Box flexDirection="row" columnGap={1}>
-            {portsText(chosen) !== '' && (
-              <Text backgroundColor={color} color="black" bold>
-                {` ${portsText(chosen)} `}
-              </Text>
-            )}
-            <Text bold wrap="truncate-end">{`${chosen.icon} ${chosen.label}`}</Text>
-          </Box>
-          <Box flexDirection="column" borderStyle="round" borderColor={color} paddingX={1} width={cardWidth}>
-            {facts(chosen, data).map(([label, value]) => (
-              <Box flexDirection="row">
-                <Box flexShrink={0} width={labelWidth}>
-                  <Text dimColor>{label}</Text>
-                </Box>
-                <Box flexDirection="column" width={valueWidth}>
-                  {label === 'Memory' ? (
-                    <Box flexDirection="row" columnGap={1}>
-                      {meter(chosen, Math.max(256 * 1024, chosen.rssKb))}
-                      <Text dimColor wrap="truncate-end">
-                        {value.slice(megabytes(chosen.rssKb).length)}
-                      </Text>
-                    </Box>
-                  ) : (
-                    value.split('\n').map(text => (
-                      <Text wrap="wrap" color={label === 'State' ? color : undefined}>
-                        {text}
-                      </Text>
-                    ))
-                  )}
-                </Box>
-              </Box>
-            ))}
-          </Box>
-          {note !== '' && <Text color="green">{`✓ ${note}`}</Text>}
-          <Box flexDirection="row" columnGap={2} flexWrap="wrap">
-            {isEnding ? (
-              <Text color="red">{`${spinner} ending…`}</Text>
-            ) : (
-              <Button
-                key="end"
-                label={isAsked ? 'Yes, end it' : 'End process'}
-                hotkey="e"
-                variant="primary"
-                onPress={() => press($, chosen.pid, () => groups.filter(g => g.pid === chosen.pid))}
-              />
-            )}
-            <Button
-              key="folder"
-              label="Open folder"
-              hotkey="f"
-              onPress={async () => {
-                await $.process.run(['open', data?.fields.cwd || chosen.cwd])
-              }}
-            />
-            {port !== undefined && (
-              <Button
-                key="browser"
-                label={`Open :${port}`}
-                hotkey="o"
-                onPress={async () => {
-                  await $.process.run(['open', `http://localhost:${port}`])
-                }}
-              />
-            )}
-            <Button
-              key="copy"
-              label="Copy command"
-              hotkey="c"
-              onPress={async pressed => {
-                await $.ui.copy({ text: data?.fields.command || chosen.command, surface: pressed.surface })
-                note = 'command copied'
-                redraw($)
-              }}
-            />
-          </Box>
-          <Text dimColor>click a button · b back · e end · f folder · c copy · Esc to the prompt</Text>
+          {heading}
+          {card}
+          {done}
+          {buttons}
+          {hint}
         </Box>
       )
     }
