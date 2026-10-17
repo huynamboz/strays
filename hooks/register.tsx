@@ -86,8 +86,27 @@ function animate($: EngineInterface, frames: number) {
   })
 }
 
-async function scan($: EngineInterface) {
-  if (isScanning) return
+// The scan running now, and the one asked for while it ran: whoever awaits a
+// scan gets one that started after it asked, so a command typed while the
+// first scan of a session still runs does not answer from an empty list.
+let running: Promise<void> | null = null
+let queued: Promise<void> | null = null
+
+function scan($: EngineInterface): Promise<void> {
+  if (running) {
+    queued ??= running.then(() => {
+      queued = null
+      return scan($)
+    })
+    return queued
+  }
+  running = scanNow($).finally(() => {
+    running = null
+  })
+  return running
+}
+
+async function scanNow($: EngineInterface) {
   isScanning = true
   try {
     const ran = await $.process.run(['sh', `${$.plugin.root}/bin/scan.sh`], { timeoutMs: 20_000 })
