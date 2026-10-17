@@ -8,6 +8,8 @@ Mac.
 `strays` is a Claude Code mod that finds every process Claude Code started and
 left running, in any session, with its port and memory, and ends it for you.
 
+![A Claude Code session opens and strays says three processes from earlier sessions are still running. /strays ls lists them with their ports and memory; /strays ui opens the panel, a click on the vite row shows it in full, and End takes it off the list.](assets/demo.gif)
+
 ```
 ❯ /strays
 👻 Left behind session closed
