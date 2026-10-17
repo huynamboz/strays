@@ -2,5 +2,9 @@
   "name": "strays",
   "version": "0.1.0",
   "description": "See every process Claude Code started and left running, in any session, with its port, and end it with one key",
-  "author": { "name": "hinam" }
+  "author": { "name": "Trịnh Huy Nam", "url": "https://github.com/huynamboz" },
+  "homepage": "https://github.com/huynamboz/strays",
+  "repository": "https://github.com/huynamboz/strays",
+  "license": "MIT",
+  "keywords": ["processes", "ports", "dev-server", "cleanup", "macos"]
 }

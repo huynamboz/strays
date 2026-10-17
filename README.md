@@ -1,11 +1,12 @@
 # strays
 
-A Claude Code mod that shows every process Claude Code started and left running,
-in any session, and ends it for you.
+Claude Code starts a dev server, a watcher or a headless browser, moves on, and
+forgets it. The process keeps running after the session is closed, holding port
+3000 and a gigabyte of memory until you hunt it down with `lsof` or restart your
+Mac.
 
-Claude starts a dev server, a watcher or a headless browser, moves on, and the
-process keeps running after the session is closed, holding a port and memory
-until you hunt it down or restart. `strays` finds them.
+`strays` is a Claude Code mod that finds every process Claude Code started and
+left running, in any session, with its port and memory, and ends it for you.
 
 ```
 ❯ /strays
@@ -19,13 +20,46 @@ until you hunt it down or restart. `strays` finds them.
 /strays 1 shows one in full · /strays kill 1 ends it · /strays ui opens the panel
 ```
 
-## Use
+## Install
 
-Needs Claude Code 2.1.287 or later, on macOS.
+Needs **macOS** and **Claude Code 2.1.287 or later** (check with `claude --version`).
+
+In a Claude Code session in your terminal, type:
+
+```
+/plugin marketplace add huynamboz/strays
+/plugin install strays@strays
+```
+
+Pick the user scope, and it runs in every session from then on. Type `/strays`.
+
+Or from a shell:
 
 ```bash
-claude --plugin-dir /path/to/strays
+claude plugin marketplace add huynamboz/strays
 ```
+
+```bash
+claude plugin install strays@strays
+```
+
+In the Claude desktop app, where `/plugin` does not run: click **+** next to the
+prompt box, then **Plugins**, **Add marketplace** with `huynamboz/strays`, then
+**Add plugin**.
+
+To update, then restart Claude Code:
+
+```bash
+claude plugin marketplace update strays && claude plugin update strays@strays
+```
+
+To remove:
+
+```bash
+claude plugin uninstall strays@strays
+```
+
+## Use
 
 | Command | Does |
 | :- | :- |
@@ -48,7 +82,7 @@ the transcript of the session that started a process opens in the editor on a
 click. The panel, the line under the prompt and the notice at a session's start
 are not drawn there: VS Code shows a mod's text and nothing else.
 
-A number names a row of the last list you printed, so `/strays` then
+A number names a row of the last list you printed, so `/strays ls` then
 `/strays kill 3` ends what you saw as row 3.
 
 ### The panel
@@ -116,10 +150,31 @@ is not a Claude Code session.
 - Other users' processes.
 - Linux and Windows: not yet. Linux needs `/proc/<pid>/environ` in place of `ps -E`.
 
+## Privacy
+
+strays reads the process table with `ps` and `lsof`, on your machine, when you
+look. It makes no network calls, keeps no log, and ends nothing you did not
+choose.
+
 ## Develop
+
+```bash
+git clone https://github.com/huynamboz/strays
+cd strays
+claude --plugin-dir .
+```
 
 ```bash
 claude plugin validate .
 claude plugin test
 npx -p typescript tsc -p .
 ```
+
+`hooks/register.tsx` is the mod (commands, panel, status line), `hooks/procs.ts`
+the logic it draws from, and `bin/` the shell scripts that scan, describe and
+end processes. Linux support needs `bin/scan.sh` to read `/proc/<pid>/environ`
+where it now reads `ps -E`; pull requests are welcome.
+
+## License
+
+MIT

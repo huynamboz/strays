@@ -1,0 +1,15 @@
+{
+  "name": "strays",
+  "description": "strays, a Claude Code mod: find and end the processes Claude Code left running",
+  "owner": {
+    "name": "Trịnh Huy Nam",
+    "url": "https://github.com/huynamboz"
+  },
+  "plugins": [
+    {
+      "name": "strays",
+      "source": "./",
+      "description": "See every process Claude Code started and left running, in any session, with its port, and end it with one key"
+    }
+  ]
+}
