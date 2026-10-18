@@ -1,6 +1,6 @@
 {
   "name": "strays",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "See every process Claude Code started and left running, in any session, with its port, and end it with one key",
   "author": { "name": "Trịnh Huy Nam", "url": "https://github.com/huynamboz" },
   "homepage": "https://github.com/huynamboz/strays",
