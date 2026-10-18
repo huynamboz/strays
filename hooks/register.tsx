@@ -3,7 +3,9 @@
 // process tree and the process group); /strays lists them, numbered, wherever
 // Claude Code runs; `/strays 2` shows one in full and `/strays kill 2` ends it;
 // `/strays ui` opens a panel in the terminal and the desktop app where a click
-// on a row shows it in full and a click on End ends it.
+// on a row shows it in full and a click on End ends it. A server left behind
+// beside a newer copy of it (vite on :3000, the new one on :3001) is marked as
+// an older copy everywhere it shows, and told of once in a toast.
 import type { EngineInterface, Register } from 'claude-code'
 
 import {
@@ -12,6 +14,9 @@ import {
   SECTIONS,
   age,
   basename,
+  clashNote,
+  clashToast,
+  clashes,
   detailMarkdown,
   detailText,
   facts,
@@ -30,7 +35,7 @@ import {
   shown,
   visible,
 } from './procs'
-import type { Group, Info, Kind } from './procs'
+import type { Clash, Group, Info, Kind } from './procs'
 
 const PANE = 'strays'
 const COMMANDS = ['strays', 'ps']
@@ -66,11 +71,26 @@ let openedAt = 0
 let spinUntil = 0
 const ending = new Set<number>()
 // The lists printed in this session, by their text: the transcript draws them from these.
-const printed = new Map<string, { groups: Group[]; order: number[] }>()
+const printed = new Map<string, { groups: Group[]; order: number[]; clashes: Clash[] }>()
+// The old copies a toast has told of, each by its pid and start: told once.
+const told = new Set<string>()
+// Whether the session draws yet: a toast sent before then is dropped.
+let isDrawn = false
 
 const redraw = ($: EngineInterface) => $.ui.invalidate('ui.render')
 const strays = () => groups.filter(g => g.kind === 'orphan' || g.kind === 'detached')
 const orphans = () => groups.filter(g => g.kind === 'orphan')
+const clashOf = (g: Group) => clashes(groups).find(c => c.old.pid === g.pid)
+
+/** A toast for each old copy of a server that was not told of yet: once each. */
+function tell($: EngineInterface) {
+  for (const clash of clashes(groups)) {
+    const key = `${clash.old.pid}@${clash.old.start}`
+    if (told.has(key)) continue
+    told.add(key)
+    $.ui.toast(clashToast(clash))
+  }
+}
 
 /** Keeps the frames coming for `frames` more, and stops by itself when nothing moves. */
 function animate($: EngineInterface, frames: number) {
@@ -122,6 +142,7 @@ async function scanNow($: EngineInterface) {
       statusText = text
       $.ui.status(text)
     }
+    if (isDrawn) tell($)
   } catch (err) {
     note = `scan failed: ${String(err)}`
   } finally {
@@ -237,7 +258,7 @@ function listing(isMarkdown: boolean) {
   }
   const list = listText(groups, me)
   order = list.order
-  printed.set(list.text, { groups: shown(groups, false), order: list.order })
+  printed.set(list.text, { groups: shown(groups, false), order: list.order, clashes: clashes(groups) })
   if (printed.size > 12) printed.delete(printed.keys().next().value ?? '')
 
   return list.text
@@ -290,6 +311,7 @@ export const register: Register = on => {
     $.clock.after(0, async () => {
       await scan($)
       whenDrawn($, () => {
+        isDrawn = true
         // The scan's status may have gone out before the screen was up: again, now that it is.
         if (statusText !== undefined) $.ui.status(statusText)
         const left = orphans()
@@ -297,6 +319,7 @@ export const register: Register = on => {
           const size = megabytes(left.reduce((sum, g) => sum + g.rssKb, 0))
           $.ui.toast(`👻 ${plural(left.length, 'process')} from earlier Claude Code sessions still running (${size}): /strays`)
         }
+        tell($)
       })
     })
     $.clock.every(5000, () => {
@@ -342,7 +365,9 @@ export const register: Register = on => {
       const data = await loadInfo($, g)
       const index = order.indexOf(g.pid) + 1
 
-      return { text: isMarkdown ? detailMarkdown(g, data, index) : detailText(g, data, index) }
+      const clash = clashOf(g)
+
+      return { text: isMarkdown ? detailMarkdown(g, data, index, clash) : detailText(g, data, index, clash) }
     }
 
     if (ask.verb === 'copy') {
@@ -431,20 +456,32 @@ export const register: Register = on => {
                 </Text>
                 <Text dimColor>{section.why}</Text>
               </Box>
-              {section.rows.map(g => (
-                <Box flexDirection="row" columnGap={1}>
-                  <Text dimColor>{`  ${String(list.order.indexOf(g.pid) + 1).padStart(digits)}`}</Text>
-                  {portsText(g) ? (
-                    <Text backgroundColor={ACCENT[g.kind]} color="black" bold>
-                      {` ${fit(portsText(g), portWidth)} `}
-                    </Text>
-                  ) : (
-                    <Text dimColor>{` ${fit('·', portWidth)} `}</Text>
-                  )}
-                  <Text bold={g.kind === 'orphan'}>{`${g.icon} ${fit(g.label, nameWidth)}`}</Text>
-                  <Text dimColor>{`${megabytes(g.rssKb).padStart(7)}  ${age(g.seconds).padStart(6)}  ${basename(g.cwd) || '/'}`}</Text>
-                </Box>
-              ))}
+              {section.rows.map(g => {
+                const n = list.order.indexOf(g.pid) + 1
+                const clash = list.clashes.find(c => c.old.pid === g.pid)
+
+                return (
+                  <Box flexDirection="column">
+                    <Box flexDirection="row" columnGap={1}>
+                      <Text dimColor>{`  ${String(n).padStart(digits)}`}</Text>
+                      {portsText(g) ? (
+                        <Text backgroundColor={ACCENT[g.kind]} color="black" bold>
+                          {` ${fit(portsText(g), portWidth)} `}
+                        </Text>
+                      ) : (
+                        <Text dimColor>{` ${fit('·', portWidth)} `}</Text>
+                      )}
+                      <Text bold={g.kind === 'orphan'}>{`${g.icon} ${fit(g.label, nameWidth)}`}</Text>
+                      <Text dimColor>{`${megabytes(g.rssKb).padStart(7)}  ${age(g.seconds).padStart(6)}  ${basename(g.cwd) || '/'}`}</Text>
+                    </Box>
+                    {clash && (
+                      <Text color="yellow">
+                        {`  ${' '.repeat(digits)}  ⚠️ ${clashNote(clash)} · /strays kill ${n} ends it and frees :${clash.oldPort}`}
+                      </Text>
+                    )}
+                  </Box>
+                )
+              })}
             </Box>
           ))}
         <Text dimColor>/strays 1 shows one in full · /strays kill 1 ends it · /strays ui opens the panel</Text>
@@ -484,6 +521,7 @@ export const register: Register = on => {
       // One group in full.
       const color = ACCENT[chosen.kind]
       const data = info?.pid === chosen.pid ? info.data : null
+      const clash = clashOf(chosen)
       const isAsked = armed === chosen.pid
       const isEnding = ending.has(chosen.pid)
       const port = chosen.ports[0]
@@ -504,7 +542,7 @@ export const register: Register = on => {
       )
       const card = (
         <Box flexDirection="column" borderStyle="round" borderColor={color} paddingX={1} width={cardWidth}>
-          {facts(chosen, data).map(([label, value]) => (
+          {facts(chosen, data, clash).map(([label, value]) => (
             <Box flexDirection="row">
               <Box flexShrink={0} width={labelWidth}>
                 <Text dimColor>{label}</Text>
@@ -519,7 +557,7 @@ export const register: Register = on => {
                   </Box>
                 ) : (
                   value.split('\n').map(text => (
-                    <Text wrap="wrap" color={label === 'State' ? color : undefined}>
+                    <Text wrap="wrap" color={label === 'State' ? color : label === 'Clash' ? 'yellow' : undefined}>
                       {text}
                     </Text>
                   ))
@@ -629,6 +667,7 @@ export const register: Register = on => {
     // A frame hugs its rows (the widest, with the question's longer button) and stops at the panel's edge.
     const frameWidth = Math.min(columns, 1 + (portWidth + 2) + nameWidth + 15 + (8 + folderWidth) + 15 + 5 + 4)
     const memory = megabytes(left.reduce((sum, g) => sum + g.rssKb, 0))
+    const found = clashes(groups)
 
     // A number over its name, in a frame the color of what it counts.
     const tile = (icon: string, value: string, name: string, color: string, isLit: boolean) => (
@@ -648,6 +687,15 @@ export const register: Register = on => {
       const isAsked = armed === g.pid
       const isEnding = ending.has(g.pid)
       const port = portsText(g)
+      const clash = found.find(c => c.old.pid === g.pid)
+      // Under an older copy of a server an open session runs: what it is, and that End frees its port.
+      const warning = clash && (
+        <Box paddingLeft={2}>
+          <Text color="yellow" wrap="truncate-end">
+            {`⚠️ ${clashNote(clash)} · End frees :${clash.oldPort}`}
+          </Text>
+        </Box>
+      )
       // Everything but the command keeps its width: the command is cut with an ellipsis.
       const mark = (
         <Box flexShrink={0}>
@@ -707,7 +755,7 @@ export const register: Register = on => {
       )
       // The row's Box has a key, so the pointer anywhere on the row lights its name.
       if (isWide) {
-        return (
+        const row = (
           <Box key={`item-${g.pid}`} flexDirection="row" columnGap={1}>
             {mark}
             {pill}
@@ -716,6 +764,15 @@ export const register: Register = on => {
             {about}
             {button}
           </Box>
+        )
+
+        return warning ? (
+          <Box flexDirection="column">
+            {row}
+            {warning}
+          </Box>
+        ) : (
+          row
         )
       }
 
@@ -732,6 +789,7 @@ export const register: Register = on => {
             {about}
             {button}
           </Box>
+          {warning}
         </Box>
       )
     }

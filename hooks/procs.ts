@@ -30,7 +30,8 @@ export type Proc = {
  */
 export type Kind = 'orphan' | 'detached' | 'running' | 'mcp'
 
-export type Member = { pid: number; start: number; label: string; rssKb: number }
+/** One process of a group: `ports` and `cwd` are its own, so a group's server can be told from its helpers. */
+export type Member = { pid: number; start: number; label: string; rssKb: number; ports: number[]; cwd: string }
 
 /** A process and everything it started, shown and ended as one. */
 export type Group = {
@@ -184,7 +185,9 @@ export function group(procs: Proc[]): Group[] {
       icon: iconOf(label, root.command),
       command: root.command.replace(/\s+/g, ' ').trim(),
       // children first, so a parent does not restart what was just ended
-      members: members.map(m => ({ pid: m.pid, start: m.start, label: describe(m.command), rssKb: m.rssKb })).reverse(),
+      members: members
+        .map(m => ({ pid: m.pid, start: m.start, label: describe(m.command), rssKb: m.rssKb, ports: m.ports, cwd: m.cwd }))
+        .reverse(),
       ports: [...new Set(members.flatMap(m => m.ports))].sort((a, b) => a - b),
       rssKb: members.reduce((sum, m) => sum + m.rssKb, 0),
       cpu: Math.round(members.reduce((sum, m) => sum + m.cpu, 0) * 10) / 10,
@@ -229,6 +232,81 @@ export const visible = (groups: Group[], kind: Kind) =>
 export const shown = (groups: Group[], withMcp: boolean) =>
   SECTIONS.filter(s => withMcp || s.kind !== 'mcp').flatMap(s => visible(groups, s.kind))
 
+// Words that start a program rather than name it: `node vite` and `npx vite` both run vite.
+const LAUNCHER = /^(node|nodejs|deno|tsx|ts-node|npx|bunx|pnpx|python[\d.]*|ruby|sh|bash|zsh|env|exec|nohup|uv|uvx)$/i
+const MANAGER = /^(npm|pnpm|yarn|bun)$/i
+
+/**
+ * The program a command runs, the same for two copies of it whatever port each
+ * was given: `node vite --port 3001` and `npx vite` are `vite`; a package
+ * manager is named with its script, `npm run dev`.
+ */
+export function programOf(label: string) {
+  // of a line of commands, the last one: `cd shop && npm run dev`
+  const commands = label.split(/&&|\|\||;/)
+  const words = (commands[commands.length - 1] ?? '')
+    .replace(/['"]/g, '')
+    .split(' ')
+    .filter(word => word !== '' && !/^\w+=/.test(word))
+  const at = words.findIndex(word => !LAUNCHER.test(word) && !word.startsWith('-') && !/^\d+$/.test(word))
+  const first = words[at] ?? ''
+  if (!MANAGER.test(first)) return first
+  const rest = words.slice(at + 1)
+
+  return [first, ...rest.slice(0, rest[0] === 'run' || rest[0] === 'run-script' ? 2 : 1)].join(' ')
+}
+
+/**
+ * A server left behind beside a newer copy of it from an open session: the same
+ * program, in the same folder, each listening. The old one keeps its port, so
+ * the new one took another (vite moves from :3000 to :3001), and the browser
+ * tab on the old port still shows the old build. `name` is the program both
+ * run, `oldPort` what ending the old one frees, `port` where the new one is.
+ */
+export type Clash = { old: Group; current: Group; name: string; oldPort: number; port: number }
+
+// What listens in a group: each member with a port, by its folder and program.
+const servers = (g: Group) =>
+  g.members
+    .filter(m => m.ports.length > 0 && m.cwd !== '')
+    .map(m => ({ cwd: m.cwd, name: programOf(m.label), port: m.ports[0] ?? 0 }))
+    .filter(s => s.name !== '')
+
+export function clashes(groups: Group[]): Clash[] {
+  // the newest first, so a stale copy is set against the latest
+  const open = groups.filter(g => g.kind === 'running' || g.kind === 'detached').sort((a, b) => b.start - a.start)
+  const out: Clash[] = []
+  for (const old of groups) {
+    if (old.kind !== 'orphan' && old.kind !== 'detached') continue
+    for (const current of open) {
+      if (current.pid === old.pid || current.start <= old.start) continue
+      // An old one whose session is still open may still be that session's: it
+      // is stale only when the same session started a newer copy.
+      if (old.kind === 'detached' && (old.claudePid === '' || current.claudePid !== old.claudePid)) continue
+      const theirs = servers(current)
+      const pair = servers(old)
+        .map(mine => [mine, theirs.find(s => s.cwd === mine.cwd && s.name === mine.name)] as const)
+        .find(([, other]) => other !== undefined)
+      if (!pair?.[1]) continue
+      out.push({ old, current, name: pair[0].name, oldPort: pair[0].port, port: pair[1].port })
+      break
+    }
+  }
+
+  return out
+}
+
+/** What is said beside the old one: `older copy of the vite on :3001`. */
+export const clashNote = (c: Clash) => `older copy of the ${c.name} on :${c.port}`
+
+/** The same in full, for the view of the old one; `port` draws a port, as a link where links work. */
+export const clashFact = (c: Clash, port = (p: number) => `:${p}`) =>
+  `older copy of the ${c.name} on ${port(c.port)}, which an open session started ${age(c.current.seconds)} ago: ending this one frees :${c.oldPort}`
+
+/** The toast a session shows once for each clash: a port names the old one, whatever the list's numbers are. */
+export const clashToast = (c: Clash) =>
+  `⚠️ An older ${c.name} still holds :${c.oldPort} and a newer one runs on :${c.port}: /strays kill :${c.oldPort} ends the old one`
+
 /** How wide each column is, so every row of the list lines up. */
 export function widths(list: Group[], columns: number) {
   const port = Math.min(14, Math.max(5, ...list.map(g => portsText(g).length)))
@@ -260,16 +338,23 @@ export function listText(groups: Group[], me: string) {
   const order = rows.map(g => g.pid)
   if (rows.length === 0) return { text: CLEAN, order }
   const digits = String(rows.length).length
+  const found = clashes(groups)
   const blocks = SECTIONS.filter(s => s.kind !== 'mcp')
     .map(section => ({ ...section, rows: visible(groups, section.kind) }))
     .filter(section => section.rows.length > 0)
     .map(section =>
       [
         `${section.icon} ${section.title} (${section.why})`,
-        ...section.rows.map(
-          g =>
-            `  ${String(order.indexOf(g.pid) + 1).padStart(digits)}  ${line(g, w).trimEnd()}${g.sid === me && g.kind !== 'orphan' ? '  this session' : ''}`,
-        ),
+        ...section.rows.flatMap(g => {
+          const n = order.indexOf(g.pid) + 1
+          const clash = found.find(c => c.old.pid === g.pid)
+          const row = `  ${String(n).padStart(digits)}  ${line(g, w).trimEnd()}${g.sid === me && g.kind !== 'orphan' ? '  this session' : ''}`
+
+          // under the old copy, what it is and how to end it
+          return clash
+            ? [row, `  ${' '.repeat(digits)}  ⚠️ ${clashNote(clash)} · /strays kill ${n} ends it and frees :${clash.oldPort}`]
+            : [row]
+        }),
       ].join('\n'),
     )
   const hasOrphans = rows.some(g => g.kind === 'orphan')
@@ -325,6 +410,7 @@ export function listMarkdown(groups: Group[], me: string) {
   if (held > 0) counts.push(`**${megabytes(held)}** held`)
   // against the heaviest here, 256 MB at least: the panel's measure
   const biggest = Math.max(256 * 1024, ...rows.map(g => g.rssKb))
+  const found = clashes(groups)
   const lines = sections.flatMap(section =>
     section.rows.map((g, i) => {
       const ports = g.ports.slice(0, 3).map(portLink)
@@ -334,7 +420,7 @@ export function listMarkdown(groups: Group[], me: string) {
         i === 0 ? together(`${section.icon} **${section.title}**`) : '',
         String(order.indexOf(g.pid) + 1),
         ports.join(' '),
-        `${g.icon} ${code(cut(g.label, 56))}${g.sid === me && g.kind !== 'orphan' ? ' _this session_' : ''}`,
+        `${g.icon} ${code(cut(g.label, 56))}${g.sid === me && g.kind !== 'orphan' ? ' _this session_' : ''}${found.some(c => c.old.pid === g.pid) ? ' ⚠️ _older copy_' : ''}`,
         plain(basename(g.cwd) || '/'),
         together(age(g.seconds)),
         // what the panel's memory bar draws in yellow or red
@@ -347,6 +433,14 @@ export function listMarkdown(groups: Group[], me: string) {
   )
   const hasOrphans = rows.some(g => g.kind === 'orphan')
   const hint = `\`/strays 1\` shows one in full · \`/strays kill 1\` ends it${hasOrphans ? ' · `/strays kill all` ends the left-behind ones' : ''}`
+  // each old copy said in a sentence under the table, where a cell would not hold it
+  const warnings = found
+    .filter(c => order.includes(c.old.pid))
+    .map(c => {
+      const n = order.indexOf(c.old.pid) + 1
+
+      return `⚠️ #${n} is an older copy of the ${plain(c.name)} on ${portLink(c.port)}: \`/strays kill ${n}\` ends it and frees :${c.oldPort}.`
+    })
 
   return {
     text: [
@@ -356,6 +450,7 @@ export function listMarkdown(groups: Group[], me: string) {
       '| :- | -: | :- | :- | :- | -: | -: | :- |',
       ...lines,
       '',
+      ...warnings.flatMap(warning => [warning, '']),
       hint,
     ].join('\n'),
     order,
@@ -379,8 +474,11 @@ export function parseInfo(stdout: string): Info {
   return info
 }
 
-/** Everything known about one group, as label and value pairs in the order they are shown. */
-export function facts(g: Group, info: Info | null): [string, string][] {
+/**
+ * Everything known about one group, as label and value pairs in the order they
+ * are shown; `clash`, when it is an older copy of a server an open session runs.
+ */
+export function facts(g: Group, info: Info | null, clash?: Clash): [string, string][] {
   const f = info?.fields ?? {}
   const session = f.session_alive
     ? `${f.session_name || 'open'} · ${f.session_kind === 'claude-vscode' ? 'VS Code' : f.session_kind === 'cli' ? 'terminal' : f.session_kind || 'Claude Code'} · ${f.session_status || 'open'}`
@@ -388,6 +486,7 @@ export function facts(g: Group, info: Info | null): [string, string][] {
   const project = f.session_cwd || f.transcript_cwd || ''
   const rows: [string, string][] = [
     ['State', STATE[g.kind]],
+    ['Clash', clash ? clashFact(clash) : ''],
     ['Ports', g.ports.length > 0 ? `${portsText(g)}  →  http://localhost:${g.ports[0]}` : ''],
     ['Folder', f.cwd || g.cwd],
     ['Command', f.command || g.command],
@@ -404,10 +503,13 @@ export function facts(g: Group, info: Info | null): [string, string][] {
   return rows.filter(([, value]) => value !== '')
 }
 
+// What the last line of one in full says: how to end it, and what that frees.
+const ends = (clash?: Clash) => `ends it${clash ? ` and frees :${clash.oldPort}` : ''}`
+
 /** One group in full, as text. */
-export function detailText(g: Group, info: Info | null, index: number) {
+export function detailText(g: Group, info: Info | null, index: number, clash?: Clash) {
   const pad = 11
-  const body = facts(g, info).map(([label, value]) => {
+  const body = facts(g, info, clash).map(([label, value]) => {
     const [first, ...rest] = value.split('\n')
 
     return [`  ${label.padEnd(pad)}${first}`, ...rest.map(more => `  ${' '.repeat(pad)}${more}`)].join('\n')
@@ -416,7 +518,7 @@ export function detailText(g: Group, info: Info | null, index: number) {
 
   const n = index > 0 ? index : g.pid
 
-  return [`${name}${g.icon} ${g.label}`, ...body, '', `/strays kill ${n} ends it · /strays copy ${n} copies its command`].join('\n')
+  return [`${name}${g.icon} ${g.label}`, ...body, '', `/strays kill ${n} ${ends(clash)} · /strays copy ${n} copies its command`].join('\n')
 }
 
 // The values that are paths or commands: drawn as code, so nothing in them is read as markdown.
@@ -427,12 +529,13 @@ const LITERAL = ['Folder', 'Command', 'Program', 'Project']
  * its number and name. Each port is a link, and so is the transcript of the
  * session that started it.
  */
-export function detailMarkdown(g: Group, info: Info | null, index: number) {
+export function detailMarkdown(g: Group, info: Info | null, index: number, clash?: Clash) {
   const state = STATE[g.kind]
   const icon = SECTIONS.find(section => section.kind === g.kind)?.icon ?? ''
   const cell = (label: string, value: string) => {
     if (LITERAL.includes(label)) return code(value)
     if (label === 'Transcript') return fileLink(value)
+    if (label === 'Clash' && clash) return `⚠️ ${clashFact({ ...clash, name: plain(clash.name) }, portLink)}`
     if (label === 'Ports') return g.ports.map(portLink).join(' ')
     if (label !== 'Processes') return plain(value)
 
@@ -441,7 +544,7 @@ export function detailMarkdown(g: Group, info: Info | null, index: number) {
       .map(row => `${row.slice(0, row.indexOf(' '))} ${code(row.slice(row.indexOf(' ') + 1))}`)
       .join(' · ')
   }
-  const rows = facts(g, info)
+  const rows = facts(g, info, clash)
     .filter(([label]) => label !== 'State')
     .map(([label, value]) => `| ${label} | ${cell(label, value)} |`)
   const n = index > 0 ? index : g.pid
@@ -453,7 +556,7 @@ export function detailMarkdown(g: Group, info: Info | null, index: number) {
     '| :- | :- |',
     ...rows,
     '',
-    `\`/strays kill ${n}\` ends it · \`/strays copy ${n}\` copies its command`,
+    `\`/strays kill ${n}\` ${ends(clash)} · \`/strays copy ${n}\` copies its command`,
   ].join('\n')
 }
 

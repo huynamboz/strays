@@ -7,6 +7,7 @@ import {
   HELP_MARKDOWN,
   age,
   bar,
+  clashes,
   describe,
   detailMarkdown,
   detailText,
@@ -18,6 +19,7 @@ import {
   parse,
   parseArgs,
   parseInfo,
+  programOf,
   resolve,
   shown,
   widths,
@@ -572,4 +574,127 @@ test('says all is clean when nothing runs, and draws docked and in the transcrip
   // any other output is left as Claude Code draws it
   const other = await $.ui.mount({ ...output, surface: 'terminal', props: { command: 'strays', args: '', isErrored: false, text: 'something else' } })
   expect(await other.find({ type: 'Text', text: 'plain' })).toBeDefined()
+})
+
+// A new copy of the shop's dev server, started through npm by the open session:
+// the old one, left behind, keeps :3000, so vite took :3001.
+const NEWER = [
+  ['901', '900', '300', '60000', 'session-1', '900', '1', '1', '', '/Users/me/shop', 'e', '901', '0.2', '9000', 'npm run dev'],
+  ['902', '901', '299', '150000', 'session-1', '900', '1', '1', '3001', '/Users/me/shop', 'e', '901', '1.0', '9001', '/usr/local/bin/node /Users/me/shop/node_modules/.bin/vite'],
+]
+// The rows of the old dev server (501, 502) with other columns: `alive attached claudePid`.
+const oldServer = (alive: string, attached: string, claudePid: string) =>
+  SCAN.slice(0, 2).map(row => row.map((field, i) => (i === 6 ? alive : i === 7 ? attached : i === 5 ? claudePid : field)))
+const CLASH_TOAST = '⚠️ An older vite still holds :3000 and a newer one runs on :3001: /strays kill :3000 ends the old one'
+
+test('names the program a command runs, whatever launched it and whatever port it was given', () => {
+  expect([
+    programOf('node vite'),
+    programOf('node vite --port 3001'),
+    programOf('npx vite'),
+    programOf('sh -c vite'),
+    programOf('cd shop && PORT=3001 npm run dev'),
+    programOf('yarn dev'),
+    programOf('Python -m http.server 8766'),
+    programOf('Python manage.py runserver 8000'),
+    programOf('node --max-old-space-size 4096 server.js'),
+    programOf(''),
+  ]).toEqual(['vite', 'vite', 'vite', 'vite', 'npm run dev', 'yarn dev', 'http.server', 'manage.py', 'server.js', ''])
+})
+
+test('a server left behind beside a newer copy of it in the same folder is an older copy', () => {
+  // the same folder and program, each listening: the old one is marked, set against the new one's port
+  const found = clashes(group(parse(tsv([...SCAN, ...NEWER]))))
+  expect(found.map(c => [c.old.pid, c.current.pid, c.name, c.oldPort, c.port])).toEqual([[501, 901, 'vite', 3000, 3001]])
+
+  // another folder, or another program, is no copy
+  const elsewhere = NEWER.map(row => row.map(field => (field === '/Users/me/shop' ? '/Users/me/blog' : field)))
+  expect(clashes(group(parse(tsv([...SCAN, ...elsewhere]))))).toEqual([])
+  const other = NEWER.map(row => row.map(field => field.replace('node_modules/.bin/vite', 'server.js')))
+  expect(clashes(group(parse(tsv([...SCAN, ...other]))))).toEqual([])
+
+  // both alive: an old one another open session runs, or one still under its session, may be in use
+  expect(clashes(group(parse(tsv([...oldServer('1', '0', '950'), ...NEWER]))))).toEqual([])
+  expect(clashes(group(parse(tsv([...oldServer('1', '1', '900'), ...NEWER]))))).toEqual([])
+  // cut loose by the very session that started a newer one, it is stale
+  expect(clashes(group(parse(tsv([...oldServer('1', '0', '900'), ...NEWER])))).map(c => c.old.pid)).toEqual([501])
+
+  // a copy started before the left-behind one is not newer
+  const earlier = NEWER.map(row => [...row.slice(0, 13), String(Number(row[13]) - 9000), ...row.slice(14)])
+  expect(clashes(group(parse(tsv([...SCAN, ...earlier]))))).toEqual([])
+})
+
+test('the older copy is said under its row and in full, in text and in markdown', () => {
+  const groups = group(parse(tsv([...SCAN, ...NEWER])))
+  const list = listText(groups, 'session-1')
+  expect(list.text).toContain('  1  :3000 :24678  🟩 node vite')
+  expect(list.text).toContain('\n     ⚠️ older copy of the vite on :3001 · /strays kill 1 ends it and frees :3000\n')
+
+  const table = listMarkdown(groups, 'session-1')
+  // the first line is still prose; the row is marked, and a sentence under the table says the rest
+  expect(table.text.split('\n')[0]).toMatch(/^\*\*1\*\* left behind · /)
+  expect(table.text).toContain('| 1 | [:3000](http://localhost:3000) [:24678](http://localhost:24678) | 🟩 `node vite` ⚠️ _older copy_ |')
+  expect(table.text).toContain(
+    '\n\n⚠️ #1 is an older copy of the vite on [:3001](http://localhost:3001): `/strays kill 1` ends it and frees :3000.\n\n`/strays 1` shows one',
+  )
+  // without a clash nothing is added
+  expect(listMarkdown(group(parse(tsv(SCAN))), 'session-1').text).toBe(LIST_MARKDOWN)
+
+  const clash = clashes(groups)[0]
+  const text = detailText(groups[0]!, parseInfo(INFO), 1, clash).split('\n')
+  expect(text[2]).toBe('  Clash      older copy of the vite on :3001, which an open session started 5m ago: ending this one frees :3000')
+  expect(text.at(-1)).toBe('/strays kill 1 ends it and frees :3000 · /strays copy 1 copies its command')
+  const markdown = detailMarkdown(groups[0]!, parseInfo(INFO), 1, clash).split('\n')
+  expect(markdown[0]).toBe('👻 Left behind: the session that started it is closed')
+  expect(markdown[4]).toBe(
+    '| Clash | ⚠️ older copy of the vite on [:3001](http://localhost:3001), which an open session started 5m ago: ending this one frees :3000 |',
+  )
+  expect(markdown.at(-1)).toBe('`/strays kill 1` ends it and frees :3000 · `/strays copy 1` copies its command')
+})
+
+test('an older copy is marked in the panel and the transcript, told once, and ended by its port', async ($, on) => {
+  const { clock, state, toasts } = machine(on)
+  state.rows = [...SCAN, ...NEWER]
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await clock.settle()
+  expect(toasts).toEqual(['👻 1 process from earlier Claude Code sessions still running (300 MB): /strays', CLASH_TOAST])
+  // the next scans find the same clash: no second toast
+  await clock.advance(60_000)
+  expect(toasts.filter(toast => toast === CLASH_TOAST)).toHaveLength(1)
+
+  // the list a command printed, drawn in the transcript: the warning under the row
+  const listed = await run($, 'ls')
+  expect(listed.text).toContain('⚠️ older copy of the vite on :3001 · /strays kill 1 ends it and frees :3000')
+  const output = { plugin: 'strays', component: 'CommandOutput', requestId: 'message-1', viewport: { columns: 120, rows: 40 } } as const
+  const drawn = await $.ui.mount({ ...output, surface: 'terminal', props: { command: 'strays', args: '', isErrored: false, text: listed.text ?? '' } })
+  expect(await drawn.find({ type: 'Text', text: /⚠️ older copy of the vite on :3001 · \/strays kill 1 ends it/ })).toBeDefined()
+  await drawn.unmount()
+  expect((await run($, '1')).text).toContain('  Clash      older copy of the vite on :3001')
+
+  // the panel: under the row, and in the full view
+  await run($, 'ui')
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '⚠️ older copy of the vite on :3001 · End frees :3000' })).toBeDefined()
+  await ui.press({ key: 'row-501' })
+  expect(await ui.find({ type: 'Text', text: /^older copy of the vite on :3001, which an open session/ })).toBeDefined()
+  await ui.press({ key: 'back' })
+  await ui.unmount()
+
+  // the toast's own command ends the old one, and the warning goes with it
+  const killed = await run($, 'kill :3000')
+  expect(state.ended).toEqual([['502@1010', '501@1000']])
+  expect(killed.text).not.toContain('older copy')
+})
+
+test('a clash that shows up later in the session is told then, once', async ($, on) => {
+  const { clock, state, toasts } = machine(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await clock.settle()
+  expect(toasts).toEqual(['👻 1 process from earlier Claude Code sessions still running (300 MB): /strays'])
+  // Claude starts the dev server again; the next scan finds the old one in the way
+  state.rows = [...SCAN, ...NEWER]
+  await clock.advance(30_000)
+  expect(toasts.at(-1)).toBe(CLASH_TOAST)
+  await clock.advance(60_000)
+  expect(toasts.filter(toast => toast === CLASH_TOAST)).toHaveLength(1)
 })

@@ -87,6 +87,12 @@ are not drawn there: VS Code shows a mod's text and nothing else.
 A number names a row of the last list you printed, so `/strays ls` then
 `/strays kill 3` ends what you saw as row 3.
 
+When a server left behind still holds a port and a session started a newer copy
+of it in the same folder (vite moves to :3001 when :3000 is taken, and the
+browser tab on :3000 keeps showing the old build), the old one is marked as an
+older copy in the list, in full and in the panel, with `/strays kill <n>` or End
+to end it; a session says so once in a toast.
+
 ### The panel
 
 `/strays ui` opens a panel beside the transcript (or above the prompt in a
